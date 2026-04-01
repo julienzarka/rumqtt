@@ -2246,8 +2246,8 @@ dependencies = [
  "pretty_assertions",
  "pretty_env_logger",
  "rand 0.9.2",
+ "rustls",
  "rustls-pemfile",
- "rustls-webpki 0.103.10",
  "serde",
  "serde_json",
  "slab",
@@ -2313,9 +2313,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
+version = "0.23.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+checksum = "533f54bc6a7d4f647e46ad909549eda97bf5afc1585190ef692b4286b198bd8f"
 dependencies = [
  "aws-lc-rs",
  "log",
