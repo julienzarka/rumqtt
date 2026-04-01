@@ -9,12 +9,12 @@ use {
 
 use crate::TlsConfig;
 #[cfg(feature = "verify-client-cert")]
-use tokio_rustls::rustls::{server::WebPkiClientVerifier, RootCertStore};
+use rustls::{server::WebPkiClientVerifier, RootCertStore};
 #[cfg(feature = "use-rustls")]
 use {
+    rustls::{pki_types::PrivateKeyDer, Error as RustlsError, ServerConfig},
     rustls_pemfile::Item,
     std::{io::BufReader, sync::Arc},
-    tokio_rustls::rustls::{pki_types::PrivateKeyDer, Error as RustlsError, ServerConfig},
     tracing::error,
 };
 
@@ -210,7 +210,11 @@ impl TLSAcceptor {
             (certs, key)
         };
 
-        let builder = ServerConfig::builder();
+        let builder = ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(Error::Rustls)?;
 
         // client authentication with a CA. CA isn't required otherwise
         #[cfg(feature = "verify-client-cert")]
@@ -227,12 +231,9 @@ impl TLSAcceptor {
                 .add(ca_cert)
                 .map_err(|_| Error::InvalidCACert(ca_path.to_string()))?;
 
-            // This will only return an error if no trust anchors are provided or invalid CRLs are
-            // provided. We always provide a trust anchor, and don't provide any CRLs, so it is safe
-            // to unwrap.
             let verifier = WebPkiClientVerifier::builder(Arc::new(store))
                 .build()
-                .unwrap();
+                .map_err(|e| Error::InvalidCACert(format!("{e}")))?;
             builder.with_client_cert_verifier(verifier)
         };
 
