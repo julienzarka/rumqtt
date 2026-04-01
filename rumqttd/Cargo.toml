@@ -35,7 +35,7 @@ tracing-subscriber = { version="0.3.18", features=["env-filter"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 clap = { version = "4.4", features = ["derive"] }
-axum = "0.8"
+axum = "0.7.4"
 rand = "0.9"
 uuid = { version = "1.7.0", features = ["v4", "fast-rng"] }
 subtle = "2.5"
