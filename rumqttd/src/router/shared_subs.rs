@@ -49,7 +49,7 @@ impl SharedGroup {
                 self.current_client_index = (self.current_client_index + 1) % self.clients.len();
             }
             Strategy::Random => {
-                self.current_client_index = rand::thread_rng().gen_range(0..self.clients.len());
+                self.current_client_index = rand::rng().random_range(0..self.clients.len());
             }
             Strategy::Sticky => {}
         }
