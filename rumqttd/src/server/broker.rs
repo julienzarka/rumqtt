@@ -9,9 +9,12 @@ use crate::protocol::v5::V5;
 use crate::protocol::{Packet, Protocol};
 #[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
 use crate::server::tls::{self, TLSAcceptor};
-use crate::{meters, ConnectionSettings, Meter};
+#[cfg(feature = "prometheus-http")]
+use crate::Meter;
+use crate::{meters, ConnectionSettings};
 use flume::{RecvError, SendError, Sender};
 use std::collections::HashMap;
+#[cfg(feature = "prometheus-http")]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use tracing::{error, field, info, warn, Instrument};
@@ -28,7 +31,9 @@ use async_tungstenite::tungstenite::http::HeaderValue;
 #[cfg(feature = "websocket")]
 use ws_stream_tungstenite::WsStream;
 
+#[cfg(feature = "prometheus-http")]
 use metrics::gauge;
+#[cfg(feature = "prometheus-http")]
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::time::Duration;
 use std::{io, thread};
@@ -263,6 +268,7 @@ impl Broker {
             }
         }
 
+        #[cfg(feature = "prometheus-http")]
         if let Some(prometheus_setting) = &self.config.prometheus {
             let timeout = prometheus_setting.interval;
             // If port is specified use it instead of listen.
