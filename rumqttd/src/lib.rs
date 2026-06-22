@@ -23,7 +23,7 @@ pub use link::local;
 pub use link::meters;
 pub use router::{Alert, Forward, IncomingMeter, Meter, Notification, OutgoingMeter, Router};
 use segments::Storage;
-pub use server::{Broker, LinkType, Server};
+pub use server::{Broker, LinkType, Server, ShutdownHandle};
 
 pub use self::router::shared_subs::Strategy;
 
@@ -74,6 +74,48 @@ pub struct PrometheusSetting {
     interval: u64,
 }
 
+/// In-memory listener TLS material: the cert chain, private key, and an optional
+/// CA, all as PEM bytes. The unit carried by [`TlsConfig::RustlsPem`] and swapped
+/// through [`ReloadableServerTls`].
+#[derive(Debug, Clone)]
+pub struct PemBundle {
+    pub ca_pem: Option<Vec<u8>>,
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+}
+
+/// A shared, hot-swappable [`PemBundle`] for the listener. The accept loop
+/// rebuilds its TLS acceptor per connection from the *current* bundle, so an
+/// embedder holding a clone of this handle can rotate the listener's identity
+/// with [`store`](Self::store) and every subsequent connection uses the new
+/// certificate — no restart, no dropped connections. Backed by a non-poisoning
+/// `parking_lot::RwLock` (reloads are rare, reads are per-connection).
+#[derive(Clone)]
+pub struct ReloadableServerTls(std::sync::Arc<parking_lot::RwLock<PemBundle>>);
+
+impl ReloadableServerTls {
+    pub fn new(bundle: PemBundle) -> Self {
+        ReloadableServerTls(std::sync::Arc::new(parking_lot::RwLock::new(bundle)))
+    }
+
+    /// Replace the listener's TLS material. New connections pick it up; existing
+    /// connections keep the session they negotiated.
+    pub fn store(&self, bundle: PemBundle) {
+        *self.0.write() = bundle;
+    }
+
+    /// Snapshot the current material for building an acceptor.
+    pub fn current(&self) -> PemBundle {
+        self.0.read().clone()
+    }
+}
+
+impl std::fmt::Debug for ReloadableServerTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReloadableServerTls(..)")
+    }
+}
+
 // TODO: Change names without _ until config-rs issue is resolved
 // https://github.com/mehcode/config-rs/issues/369
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -84,6 +126,22 @@ pub enum TlsConfig {
         certpath: String,
         keypath: String,
     },
+    /// In-memory PEM material for the listener — cert chain, private key and an
+    /// optional CA, all as PEM bytes. Lets an embedder (e.g. the mosqtt broker)
+    /// hand the listener a self-issued identity without first materialising it
+    /// to disk. Built programmatically, never parsed from a config file.
+    RustlsPem {
+        ca_pem: Option<Vec<u8>>,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+    },
+    /// Hot-swappable in-memory PEM material — like [`Self::RustlsPem`], but the
+    /// acceptor is rebuilt from the current [`ReloadableServerTls`] snapshot per
+    /// connection, so the embedder can rotate the leaf in place. Constructed
+    /// programmatically and never (de)serialised (`serde(skip)`): it carries a
+    /// shared handle, not config data.
+    #[serde(skip)]
+    RustlsReloadable(ReloadableServerTls),
     NativeTls {
         pkcs12path: String,
         pkcs12pass: String,
@@ -103,6 +161,15 @@ impl TlsConfig {
                 let ca = capath.is_none() || capath.as_ref().is_some_and(|v| Path::new(v).exists());
 
                 ca && [certpath, keypath].iter().all(|v| Path::new(v).exists())
+            }
+            // In-memory material has no paths to check; "valid" iff cert and key
+            // bytes are present.
+            TlsConfig::RustlsPem {
+                cert_pem, key_pem, ..
+            } => !cert_pem.is_empty() && !key_pem.is_empty(),
+            TlsConfig::RustlsReloadable(handle) => {
+                let bundle = handle.current();
+                !bundle.cert_pem.is_empty() && !bundle.key_pem.is_empty()
             }
             TlsConfig::NativeTls { pkcs12path, .. } => Path::new(pkcs12path).exists(),
         }
