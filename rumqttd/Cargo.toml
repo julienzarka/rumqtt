@@ -54,3 +54,6 @@ prometheus-http = ["metrics-exporter-prometheus/http-listener"]
 pretty_env_logger = "0.5.0"
 config = "0.15"
 pretty_assertions = "1.4.0"
+# Exercises the verify-client-cert path: generates an in-memory CA and CA-signed
+# / self-signed client leaves so the mTLS accept/reject test has real material.
+rcgen = "0.12"
