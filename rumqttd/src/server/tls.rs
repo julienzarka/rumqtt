@@ -389,3 +389,179 @@ fn first_private_key_in_pemfile(key_path: &String) -> Result<PrivateKeyDer<'stat
         }
     }
 }
+
+/// mTLS verification (verify-client-cert): the `rustls_pem` branch builds a
+/// `WebPkiClientVerifier` from the in-memory CA. mosqtt builds the fork without
+/// this feature, so the branch was compile-checked only; this drives a real
+/// handshake to prove the verifier accepts a CA-signed client cert and rejects
+/// an unsigned one. Run with `--features use-rustls,verify-client-cert`.
+#[cfg(all(test, feature = "verify-client-cert"))]
+mod verify_client_cert_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa};
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::CryptoProvider;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsConnector;
+
+    /// An in-memory PKI: a CA, a CA-signed server leaf, a CA-signed client leaf
+    /// (the valid case) and a self-signed client leaf (the rogue case).
+    struct Pki {
+        ca_pem: Vec<u8>,
+        server_cert: Vec<u8>,
+        server_key: Vec<u8>,
+        valid_client_cert: Vec<u8>,
+        valid_client_key: Vec<u8>,
+        rogue_client_cert: Vec<u8>,
+        rogue_client_key: Vec<u8>,
+    }
+
+    fn leaf(san: &str) -> Certificate {
+        Certificate::from_params(CertificateParams::new(vec![san.to_string()]))
+            .expect("generate leaf")
+    }
+
+    fn make_pki() -> Pki {
+        let mut ca_params = CertificateParams::new(Vec::<String>::new());
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = Certificate::from_params(ca_params).expect("generate CA");
+
+        let server = leaf("localhost");
+        let valid_client = leaf("valid-client");
+        let rogue_client = leaf("rogue-client");
+
+        Pki {
+            ca_pem: ca.serialize_pem().expect("ca pem").into_bytes(),
+            server_cert: server
+                .serialize_pem_with_signer(&ca)
+                .expect("server pem")
+                .into_bytes(),
+            server_key: server.serialize_private_key_pem().into_bytes(),
+            valid_client_cert: valid_client
+                .serialize_pem_with_signer(&ca)
+                .expect("client pem")
+                .into_bytes(),
+            valid_client_key: valid_client.serialize_private_key_pem().into_bytes(),
+            // Self-signed: NOT chained to the CA the server trusts.
+            rogue_client_cert: rogue_client
+                .serialize_pem()
+                .expect("rogue pem")
+                .into_bytes(),
+            rogue_client_key: rogue_client.serialize_private_key_pem().into_bytes(),
+        }
+    }
+
+    /// Test-only: accept any server certificate. We are testing client-cert
+    /// verification on the server, not server-cert verification on the client.
+    #[derive(Debug)]
+    struct AcceptAnyServer(Arc<CryptoProvider>);
+    impl ServerCertVerifier for AcceptAnyServer {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _m: &[u8],
+            _c: &CertificateDer<'_>,
+            _d: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _m: &[u8],
+            _c: &CertificateDer<'_>,
+            _d: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    fn client_config(client_cert_pem: &[u8], client_key_pem: &[u8]) -> ClientConfig {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &client_cert_pem[..])
+            .collect::<Result<_, _>>()
+            .expect("parse client certs");
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &client_key_pem[..])
+            .expect("read client key")
+            .expect("one client key");
+
+        ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("client protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServer(provider)))
+            .with_client_auth_cert(certs, key)
+            .expect("client auth cert")
+    }
+
+    /// Run one mTLS handshake against a `rustls_pem`-built verify-client-cert
+    /// listener using the given client identity. `Ok` iff the server accepted.
+    async fn handshake(pki: &Pki, client_cert: &[u8], client_key: &[u8]) -> Result<(), ()> {
+        let acceptor = TLSAcceptor::new(&TlsConfig::RustlsPem {
+            ca_pem: Some(pki.ca_pem.clone()),
+            cert_pem: pki.server_cert.clone(),
+            key_pem: pki.server_key.clone(),
+        })
+        .expect("verify-client-cert acceptor builds from in-memory CA");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let connector = TlsConnector::from(Arc::new(client_config(client_cert, client_key)));
+        let client = tokio::spawn(async move {
+            let tcp = match TcpStream::connect(addr).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let name = ServerName::try_from("localhost").expect("server name");
+            // A rejected client cert surfaces as a connect/IO error here — ignore
+            // it; the server side is what the assertions check.
+            if let Ok(mut tls) = connector.connect(name, tcp).await {
+                let _ = tls.write_all(b"x").await;
+                let _ = tls.flush().await;
+                let _ = tls.shutdown().await;
+            }
+        });
+
+        let (tcp, _) = listener.accept().await.expect("accept tcp");
+        let result = acceptor.accept(tcp).await;
+        let _ = client.await;
+        result.map(|_| ()).map_err(|_| ())
+    }
+
+    #[tokio::test]
+    async fn valid_client_cert_accepted_rogue_rejected() {
+        // Unambiguous provider for the bare client builder; Err = already set.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pki = make_pki();
+
+        assert!(
+            handshake(&pki, &pki.valid_client_cert, &pki.valid_client_key)
+                .await
+                .is_ok(),
+            "a client cert signed by the configured CA must be accepted"
+        );
+        assert!(
+            handshake(&pki, &pki.rogue_client_cert, &pki.rogue_client_key)
+                .await
+                .is_err(),
+            "a client cert not signed by the configured CA must be rejected"
+        );
+    }
+}
