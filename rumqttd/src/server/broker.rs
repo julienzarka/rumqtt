@@ -78,13 +78,34 @@ pub enum Error {
 pub struct ShutdownHandle(Arc<tokio::sync::watch::Sender<bool>>);
 
 impl ShutdownHandle {
-    /// Signal every listener spawned by `start()` to stop accepting new
-    /// connections and return, which drops the listening socket and frees the
-    /// port. In-flight connection tasks are dropped with the server runtimes.
+    /// Signal every thread spawned by `start()` — the v4/v5/ws listeners plus
+    /// the timer, bridge, metrics and console helpers — to stop and return. The
+    /// listener sockets are dropped (freeing the bound ports) and the helper
+    /// threads exit their loops, so `start()` (which joins them all) returns.
+    /// In-flight connection tasks are dropped with the server runtimes.
     pub fn shutdown(&self) {
         // Err only if all receivers are gone (listeners already stopped) — a
         // no-op for our purposes, so the result is intentionally ignored.
         let _ = self.0.send(true);
+    }
+}
+
+/// Resolve once the broker's shutdown signal is set (or every sender has been
+/// dropped, i.e. the broker is gone). Lets the non-listener helper threads
+/// (timer, bridge, console) race their work against shutdown via
+/// `tokio::select!`, so [`ShutdownHandle::shutdown`] winds down the whole broker
+/// rather than only the listener accept loops. Runtime-agnostic: the watch
+/// channel crosses the per-thread tokio runtimes.
+async fn wait_for_shutdown(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    // `changed()` errs only when all senders are dropped (broker gone) — treat as
+    // a stop. The loop guards spurious wakeups where the value is still `false`.
+    while rx.changed().await.is_ok() {
+        if *rx.borrow_and_update() {
+            return;
+        }
     }
 }
 
@@ -213,37 +234,53 @@ impl Broker {
             ));
         }
 
-        // we don't know which servers (v4/v5/ws) user will spawn
-        // so we collect handles for all of the spawned servers
-        let mut server_thread_handles = Vec::new();
+        // We don't know which servers (v4/v5/ws) the user will spawn, and we
+        // also spawn timer/bridge/metrics/console helpers — collect every
+        // thread handle so start() joins them all and returns only once
+        // shutdown() has wound the whole broker down.
+        let mut thread_handles = Vec::new();
 
         if let Some(metrics_config) = self.config.metrics.clone() {
             let timer_thread = thread::Builder::new().name("timer".to_owned());
             let router_tx = self.router_tx.clone();
-            timer_thread.spawn(move || {
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let handle = timer_thread.spawn(move || {
                 let mut runtime = tokio::runtime::Builder::new_current_thread();
                 let runtime = runtime.enable_all().build().unwrap();
 
                 runtime.block_on(async move {
-                    timer::start(metrics_config, router_tx).await;
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => {}
+                        _ = timer::start(metrics_config, router_tx) => {}
+                    }
                 });
             })?;
+            thread_handles.push(handle);
         }
 
         // Spawn bridge in a separate thread.
         if let Some(bridge_config) = self.config.bridge.clone() {
             let bridge_thread = thread::Builder::new().name(bridge_config.name.clone());
             let router_tx = self.router_tx.clone();
-            bridge_thread.spawn(move || {
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let handle = bridge_thread.spawn(move || {
                 let mut runtime = tokio::runtime::Builder::new_current_thread();
                 let runtime = runtime.enable_all().build().unwrap();
 
                 runtime.block_on(async move {
-                    if let Err(e) = bridge::start(bridge_config, router_tx, V4).await {
-                        error!(error=?e, "Bridge Link error");
-                    };
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => {}
+                        res = bridge::start(bridge_config, router_tx, V4) => {
+                            if let Err(e) = res {
+                                error!(error=?e, "Bridge Link error");
+                            }
+                        }
+                    }
                 });
             })?;
+            thread_handles.push(handle);
         }
 
         // Spawn servers in a separate thread.
@@ -262,7 +299,7 @@ impl Broker {
                         }
                     });
                 })?;
-                server_thread_handles.push(handle)
+                thread_handles.push(handle)
             }
         }
 
@@ -281,7 +318,7 @@ impl Broker {
                         }
                     });
                 })?;
-                server_thread_handles.push(handle)
+                thread_handles.push(handle)
             }
         }
 
@@ -307,7 +344,7 @@ impl Broker {
                         }
                     });
                 })?;
-                server_thread_handles.push(handle)
+                thread_handles.push(handle)
             }
         }
 
@@ -329,7 +366,8 @@ impl Broker {
             };
             let metrics_thread = thread::Builder::new().name("Metrics".to_owned());
             let meter_link = self.meters().unwrap();
-            metrics_thread.spawn(move || {
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let handle = metrics_thread.spawn(move || {
                 let builder = PrometheusBuilder::new().with_http_listener(addr);
                 builder.install().unwrap();
 
@@ -337,6 +375,11 @@ impl Broker {
                 let total_connections = gauge!("metrics.router.total_connections");
                 let failed_publishes = gauge!("metrics.router.failed_publishes");
                 loop {
+                    // Stop on shutdown. `recv()` is non-blocking (try_recv), so the
+                    // signal is observed at worst one `timeout` interval late.
+                    if *shutdown_rx.borrow_and_update() {
+                        break;
+                    }
                     if let Ok(metrics) = meter_link.recv() {
                         for m in metrics {
                             match m {
@@ -353,6 +396,7 @@ impl Broker {
                     std::thread::sleep(Duration::from_secs(timeout));
                 }
             })?;
+            thread_handles.push(handle);
         }
 
         if let Some(console) = self.config.console.clone() {
@@ -360,17 +404,25 @@ impl Broker {
 
             let console_link = Arc::new(console_link);
             let console_thread = thread::Builder::new().name("Console".to_string());
-            console_thread.spawn(move || {
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let handle = console_thread.spawn(move || {
                 let mut runtime = tokio::runtime::Builder::new_current_thread();
                 let runtime = runtime.enable_all().build().unwrap();
-                runtime.block_on(console::start(console_link));
+                runtime.block_on(async move {
+                    tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown_rx) => {}
+                        _ = console::start(console_link) => {}
+                    }
+                });
             })?;
+            thread_handles.push(handle);
         }
 
-        // in ideal case, where server doesn't crash, join() will never resolve
-        // we still try to join threads so that we don't return from function
-        // unless everything crashes.
-        server_thread_handles.into_iter().for_each(|handle| {
+        // In the ideal case (no crash, no shutdown) join() never resolves; on
+        // shutdown() every thread returns and these joins unblock, so start()
+        // returns only after the whole broker has wound down.
+        thread_handles.into_iter().for_each(|handle| {
             // join() might panic in case the thread panics
             // we just ignore it
             let _ = handle.join();
@@ -691,5 +743,76 @@ async fn remote<P: Protocol>(
         // It won't matter in this case as we don't use it
         // but might affect logs?
         router_tx.send((connection_id, message)).ok();
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Regression for the latent graceful-shutdown gap: `shutdown()` must stop
+    /// the non-listener helper threads too. We enable the metrics `timer` thread
+    /// (the simplest helper — gated only by `[metrics]`, needs no extra port)
+    /// alongside a v4 listener, start the broker on a background thread, then
+    /// signal shutdown. `start()` joins every spawned thread, so it returns only
+    /// once the timer thread has also observed the signal; if it had not, this
+    /// test would hit the join timeout.
+    #[test]
+    fn shutdown_stops_helper_threads_not_just_listeners() {
+        const STARTUP_MS: u64 = 300;
+        const JOIN_TIMEOUT_SECS: u64 = 10;
+
+        // Ephemeral port (":0") so the test never collides with a fixed listener.
+        let toml = r#"
+id = 0
+[router]
+id = 0
+max_connections = 100
+max_outgoing_packet_count = 200
+max_segment_size = 104857600
+max_segment_count = 10
+[v4.1]
+name = "v4-1"
+listen = "127.0.0.1:0"
+next_connection_delay_ms = 1
+[v4.1.connections]
+connection_timeout_ms = 60000
+max_payload_size = 20480
+max_inflight_count = 100
+dynamic_filters = true
+[metrics.alerts]
+push_interval = 1
+[metrics.meters]
+push_interval = 1
+"#;
+
+        let cfg: Config = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+
+        let mut broker = Broker::new(cfg);
+        let shutdown = broker.shutdown_handle();
+        let started = std::thread::spawn(move || broker.start());
+
+        // Let the listener and timer threads spin up, then ask the broker to stop.
+        std::thread::sleep(Duration::from_millis(STARTUP_MS));
+        shutdown.shutdown();
+
+        let deadline = Instant::now() + Duration::from_secs(JOIN_TIMEOUT_SECS);
+        while !started.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "start() did not return after shutdown() — a helper thread ignored the signal"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        started
+            .join()
+            .expect("broker thread panicked")
+            .expect("broker start returned an error");
     }
 }
