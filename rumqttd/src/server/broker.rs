@@ -69,9 +69,32 @@ pub enum Error {
     Config(String),
 }
 
+/// Handle to signal a running [`Broker`]'s listeners to stop accepting and
+/// return. Obtained via [`Broker::shutdown_handle`] before `start()` is called
+/// (since `start()` blocks), and kept by the embedder so it can free the bound
+/// port — e.g. to restart the listener with a rotated TLS certificate. Cloning
+/// the handle is cheap; `shutdown()` is idempotent.
+#[derive(Clone)]
+pub struct ShutdownHandle(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl ShutdownHandle {
+    /// Signal every listener spawned by `start()` to stop accepting new
+    /// connections and return, which drops the listening socket and frees the
+    /// port. In-flight connection tasks are dropped with the server runtimes.
+    pub fn shutdown(&self) {
+        // Err only if all receivers are gone (listeners already stopped) — a
+        // no-op for our purposes, so the result is intentionally ignored.
+        let _ = self.0.send(true);
+    }
+}
+
 pub struct Broker {
     config: Arc<Config>,
     router_tx: Sender<(ConnectionId, Event)>,
+    /// Broadcasts a stop request to every listener's accept loop. Watch (not a
+    /// one-shot): each server thread `subscribe()`s its own receiver, and the
+    /// signal is runtime-agnostic so it crosses the per-thread tokio runtimes.
+    shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Broker {
@@ -79,6 +102,8 @@ impl Broker {
         let config = Arc::new(config);
         let router_config = config.router.clone();
         let router: Router = Router::new(config.id, router_config);
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let shutdown_tx = Arc::new(shutdown_tx);
 
         // Setup cluster if cluster settings are configured.
         match config.cluster.clone() {
@@ -92,13 +117,28 @@ impl Broker {
                 // Start router first and then cluster in the background
                 let router_tx = router.spawn();
                 // cluster.spawn();
-                Broker { config, router_tx }
+                Broker {
+                    config,
+                    router_tx,
+                    shutdown_tx,
+                }
             }
             None => {
                 let router_tx = router.spawn();
-                Broker { config, router_tx }
+                Broker {
+                    config,
+                    router_tx,
+                    shutdown_tx,
+                }
             }
         }
+    }
+
+    /// Obtain a [`ShutdownHandle`] for this broker. Call this **before**
+    /// [`Broker::start`] (which blocks until the listeners return) and keep the
+    /// handle to later stop the listeners and free the bound port.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle(self.shutdown_tx.clone())
     }
 
     // pub fn new_local_cluster(
@@ -211,12 +251,13 @@ impl Broker {
             for (_, config) in v4_config.clone() {
                 let server_thread = thread::Builder::new().name(config.name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
+                let shutdown_rx = self.shutdown_tx.subscribe();
                 let handle = server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
 
                     runtime.block_on(async {
-                        if let Err(e) = server.start(LinkType::Remote).await {
+                        if let Err(e) = server.start(LinkType::Remote, shutdown_rx).await {
                             error!(error=?e, "Server error - V4");
                         }
                     });
@@ -229,12 +270,13 @@ impl Broker {
             for (_, config) in v5_config.clone() {
                 let server_thread = thread::Builder::new().name(config.name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V5);
+                let shutdown_rx = self.shutdown_tx.subscribe();
                 let handle = server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
 
                     runtime.block_on(async {
-                        if let Err(e) = server.start(LinkType::Remote).await {
+                        if let Err(e) = server.start(LinkType::Remote, shutdown_rx).await {
                             error!(error=?e, "Server error - V5");
                         }
                     });
@@ -254,12 +296,13 @@ impl Broker {
                 let server_thread = thread::Builder::new().name(config.name.clone());
                 //TODO: Add support for V5 procotol with websockets. Registered in config or on ServerSettings
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
+                let shutdown_rx = self.shutdown_tx.subscribe();
                 let handle = server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
 
                     runtime.block_on(async {
-                        if let Err(e) = server.start(LinkType::Websocket).await {
+                        if let Err(e) = server.start(LinkType::Websocket, shutdown_rx).await {
                             error!(error=?e, "Server error - WS");
                         }
                     });
@@ -385,7 +428,11 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
         Ok((Box::new(stream), None))
     }
 
-    pub async fn start(&mut self, link_type: LinkType) -> Result<(), Error> {
+    pub async fn start(
+        &mut self,
+        link_type: LinkType,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), Error> {
         let listener = TcpListener::bind(&self.config.listen).await?;
         let delay = Duration::from_millis(self.config.next_connection_delay_ms);
         let mut count: usize = 0;
@@ -397,12 +444,25 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
             "Listening for remote connections",
         );
         loop {
-            // Await new network connection.
-            let (stream, addr) = match listener.accept().await {
-                Ok((s, r)) => (s, r),
-                Err(e) => {
-                    error!(error=?e, "Unable to accept socket.");
+            // Await a new connection, or a shutdown signal. On shutdown the loop
+            // returns, dropping `listener` and freeing the bound port so the
+            // embedder can rebind (e.g. to load a rotated TLS certificate).
+            let (stream, addr) = tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    // Err => all senders dropped (broker gone); treat as stop.
+                    if changed.is_err() || *shutdown_rx.borrow_and_update() {
+                        info!(config = self.config.name, "listener shutting down");
+                        return Ok(());
+                    }
                     continue;
+                }
+                accepted = listener.accept() => match accepted {
+                    Ok((s, r)) => (s, r),
+                    Err(e) => {
+                        error!(error=?e, "Unable to accept socket.");
+                        continue;
+                    }
                 }
             };
 

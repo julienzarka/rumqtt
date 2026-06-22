@@ -103,6 +103,19 @@ impl TLSAcceptor {
                 certpath,
                 keypath,
             } => Self::rustls(capath, certpath, keypath),
+            #[cfg(feature = "use-rustls")]
+            TlsConfig::RustlsPem {
+                ca_pem,
+                cert_pem,
+                key_pem,
+            } => Self::rustls_pem(ca_pem, cert_pem, key_pem),
+            #[cfg(feature = "use-rustls")]
+            TlsConfig::RustlsReloadable(handle) => {
+                // Snapshot the current material; subsequent rotations are picked
+                // up on the next connection's acceptor rebuild.
+                let bundle = handle.current();
+                Self::rustls_pem(&bundle.ca_pem, &bundle.cert_pem, &bundle.key_pem)
+            }
             #[cfg(feature = "use-native-tls")]
             TlsConfig::NativeTls {
                 pkcs12path,
@@ -110,6 +123,10 @@ impl TLSAcceptor {
             } => Self::native_tls(pkcs12path, pkcs12pass),
             #[cfg(not(feature = "use-rustls"))]
             TlsConfig::Rustls { .. } => Err(Error::RustlsNotEnabled),
+            #[cfg(not(feature = "use-rustls"))]
+            TlsConfig::RustlsPem { .. } => Err(Error::RustlsNotEnabled),
+            #[cfg(not(feature = "use-rustls"))]
+            TlsConfig::RustlsReloadable(_) => Err(Error::RustlsNotEnabled),
             #[cfg(not(feature = "use-native-tls"))]
             TlsConfig::NativeTls { .. } => Err(Error::NativeTlsNotEnabled),
         }
@@ -244,6 +261,97 @@ impl TLSAcceptor {
 
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
         Ok(TLSAcceptor::Rustls { acceptor })
+    }
+
+    /// Build a rustls acceptor from in-memory PEM bytes instead of file paths.
+    /// Mirrors [`Self::rustls`] but parses the cert chain, private key and
+    /// optional CA from byte slices, so the embedder never has to materialise
+    /// the private key to disk (and can hand the listener a rotated identity).
+    #[cfg(feature = "use-rustls")]
+    fn rustls_pem(
+        ca_pem: &Option<Vec<u8>>,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<TLSAcceptor, Error> {
+        #[cfg(feature = "verify-client-cert")]
+        let Some(ca_pem) = ca_pem
+        else {
+            return Err(Error::CaFileNotFound(
+                "ca_pem must be specified when verify-client-cert is enabled.".to_string(),
+            ));
+        };
+
+        #[cfg(not(feature = "verify-client-cert"))]
+        if ca_pem.is_some() {
+            tracing::warn!("verify-client-cert feature is disabled, in-memory CA cert will be ignored and no client authentication is done.");
+        }
+
+        let (certs, key) = {
+            let mut cert_rd = cert_pem;
+            let certs = rustls_pemfile::certs(&mut cert_rd)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| Error::InvalidServerCert("<in-memory cert>".to_string()))?;
+
+            let key = first_private_key_in_pem_bytes(key_pem)?;
+
+            (certs, key)
+        };
+
+        let builder = ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(Error::Rustls)?;
+
+        #[cfg(feature = "verify-client-cert")]
+        let builder = {
+            let mut ca_rd = ca_pem.as_slice();
+            let ca_cert = rustls_pemfile::certs(&mut ca_rd)
+                .next()
+                .ok_or_else(|| Error::InvalidCACert("<in-memory ca>".to_string()))??;
+
+            let mut store = RootCertStore::empty();
+            store
+                .add(ca_cert)
+                .map_err(|_| Error::InvalidCACert("<in-memory ca>".to_string()))?;
+
+            let verifier = WebPkiClientVerifier::builder(Arc::new(store))
+                .build()
+                .map_err(|e| Error::InvalidCACert(format!("{e}")))?;
+            builder.with_client_cert_verifier(verifier)
+        };
+
+        #[cfg(not(feature = "verify-client-cert"))]
+        let builder = builder.with_no_client_auth();
+
+        let server_config = builder.with_single_cert(certs, key)?;
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        Ok(TLSAcceptor::Rustls { acceptor })
+    }
+}
+
+#[cfg(feature = "use-rustls")]
+/// Get the first private key in an in-memory PEM byte slice (sibling of
+/// [`first_private_key_in_pemfile`] that reads bytes instead of a file).
+fn first_private_key_in_pem_bytes(key_pem: &[u8]) -> Result<PrivateKeyDer<'static>, Error> {
+    let mut rd = key_pem;
+    loop {
+        let item = rustls_pemfile::read_one(&mut rd).map_err(|err| {
+            error!("Error reading in-memory key: {:?}", err);
+            Error::InvalidServerKey("<in-memory key>".to_string())
+        })?;
+
+        match item {
+            Some(Item::Sec1Key(key)) => return Ok(key.into()),
+            Some(Item::Pkcs1Key(key)) => return Ok(key.into()),
+            Some(Item::Pkcs8Key(key)) => return Ok(key.into()),
+            None => {
+                error!("No private key found in in-memory PEM");
+                return Err(Error::InvalidServerKey("<in-memory key>".to_string()));
+            }
+            _ => {}
+        }
     }
 }
 
