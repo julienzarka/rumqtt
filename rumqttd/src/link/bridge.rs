@@ -204,14 +204,21 @@ pub async fn tls_connect<P: AsRef<Path>>(
     let mut root_cert_store = RootCertStore::empty();
 
     for cert in rustls_pemfile::certs(&mut BufReader::new(Cursor::new(fs::read(ca_file)?))) {
-        root_cert_store.add(cert?)?;
+        root_cert_store
+            .add(cert?)
+            .map_err(|_| BridgeError::CertStore)?;
     }
 
     if root_cert_store.is_empty() {
         return Err(BridgeError::NoValidCertInChain);
     }
 
-    let config = ClientConfig::builder().with_root_certificates(root_cert_store);
+    let config = ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| BridgeError::Tls(e))?
+    .with_root_certificates(root_cert_store);
 
     let config = if let Some(ClientAuth {
         certs: certs_path,
@@ -301,9 +308,9 @@ pub enum BridgeError {
     Io(#[from] io::Error),
     #[error("Network - {0}")]
     Network(#[from] network::Error),
-    #[error("Web Pki - {0}")]
+    #[error("Certificate store error")]
     #[cfg(feature = "use-rustls")]
-    WebPki(#[from] webpki::Error),
+    CertStore,
     #[error("DNS name - {0}")]
     #[cfg(feature = "use-rustls")]
     DNSName(#[from] InvalidDnsNameError),

@@ -18,10 +18,10 @@ serde_json = "1.0.113"
 bytes = { version = "1", features = ["serde"] }
 flume = { version = "0.11.0", default-features = false, features = ["async"]}
 slab = "0.4.9"
-thiserror = "2"
+thiserror = "2.0"
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
 tokio-rustls = { version = "0.26", optional = true }
-rustls-webpki = { version = "0.103", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
 tokio-native-tls = { version = "0.3.1", optional = true }
 rustls-pemfile = { version = "2.1.0", optional = true }
 async-tungstenite = { version = "0.25", default-features = false, features = ["tokio-runtime"], optional = true }
@@ -33,7 +33,7 @@ config = "0.15"
 tracing = { version="0.1", features=["log"] }
 tracing-subscriber = { version="0.3.18", features=["env-filter"] }
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 clap = { version = "4.4", features = ["derive"] }
 axum = "0.8"
 rand = "0.9"
@@ -42,14 +42,18 @@ subtle = "2.5"
 
 [features]
 default = ["use-rustls", "websocket"]
-use-rustls = ["dep:tokio-rustls", "dep:rustls-webpki", "dep:rustls-pemfile", "dep:x509-parser"]
+use-rustls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:x509-parser", "rustls/aws_lc_rs"]
 use-native-tls = ["dep:tokio-native-tls", "dep:x509-parser"]
 websocket = ["dep:async-tungstenite", "dep:tokio-util", "dep:futures-util", "dep:ws_stream_tungstenite"]
 verify-client-cert = []
 validate-tenant-prefix = ["verify-client-cert"]
 allow-duplicate-clientid = []
+prometheus-http = ["metrics-exporter-prometheus/http-listener"]
 
 [dev-dependencies]
 pretty_env_logger = "0.5.0"
 config = "0.15"
 pretty_assertions = "1.4.0"
+# Exercises the verify-client-cert path: generates an in-memory CA and CA-signed
+# / self-signed client leaves so the mTLS accept/reject test has real material.
+rcgen = "0.12"

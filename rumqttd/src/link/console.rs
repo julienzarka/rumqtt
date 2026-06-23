@@ -48,10 +48,10 @@ pub async fn start(console: Arc<ConsoleLink>) {
         .route("/", get(root))
         .route("/config", get(config))
         .route("/router", get(router))
-        .route("/device/:device_id", get(device_with_id))
+        .route("/device/{device_id}", get(device_with_id))
         .route("/subscriptions", get(subscriptions))
-        .route("/subscriptions/:filter", get(subscriptions_with_filter))
-        .route("/waiters/:filter", get(waiters_with_filter))
+        .route("/subscriptions/{filter}", get(subscriptions_with_filter))
+        .route("/waiters/{filter}", get(waiters_with_filter))
         .route("/readyqueue", get(readyqueue))
         .route("/logs", post(logs))
         .with_state(console);
