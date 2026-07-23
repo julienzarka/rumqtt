@@ -57,3 +57,4 @@ pids
 # dotenv environment variable files
 .env
 .env.*
+.serena/
