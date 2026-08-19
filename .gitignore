@@ -58,3 +58,29 @@ pids
 .env
 .env.*
 .serena/
+
+# ================
+# MOS4 WORKSPACE (aligned with mos4-gamma/.gitignore)
+# ================
+# Per-session cargo target dirs (CARGO_TARGET_DIR=target-chatN)
+**/target
+**/target-*
+
+# Build/test log artifacts (tools/build-serialized.sh)
+.mos4-logs/
+**/*.logs
+
+# Backup / scratch files
+**/*.bak
+**/*.backup
+*.patch
+out_dir/
+.backup/
+
+# Coverage profiling artifacts
+*.profraw
+*.profdata
+
+# Per-developer tooling state
+.claude/settings.local.json
+**/.DS_Store
