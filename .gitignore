@@ -84,3 +84,5 @@ out_dir/
 # Per-developer tooling state
 .claude/settings.local.json
 **/.DS_Store
+-- .serena
+.serena
