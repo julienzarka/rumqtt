@@ -313,9 +313,12 @@ impl LinkTx {
 
     /// Request to get device shadow
     pub fn shadow<S: Into<String>>(&mut self, filter: S) -> Result<(), LinkError> {
-        let message = Event::Shadow(ShadowRequest {
-            filter: filter.into(),
-        });
+        let message = Event::Shadow {
+            request: ShadowRequest {
+                filter: filter.into(),
+            },
+            incoming: self.recv_buffer.clone(),
+        };
 
         self.router_tx.try_send((self.connection_id, message))?;
         Ok(())

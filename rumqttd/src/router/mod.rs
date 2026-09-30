@@ -60,8 +60,12 @@ pub enum Event {
     Disconnect {
         incoming: std::sync::Arc<parking_lot::Mutex<VecDeque<Packet>>>,
     },
-    /// Shadow
-    Shadow(ShadowRequest),
+    /// Shadow request. Carries the link's incoming buffer for the same reason
+    /// as `Disconnect`: the reply must go to the link that asked.
+    Shadow {
+        request: ShadowRequest,
+        incoming: std::sync::Arc<parking_lot::Mutex<VecDeque<Packet>>>,
+    },
     /// Collect and send alerts to all alerts links
     SendAlerts,
     /// Collect and send meters to all meters links

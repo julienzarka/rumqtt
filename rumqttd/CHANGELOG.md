@@ -12,8 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Deprecated
 ### Removed
 ### Fixed
-- A graceful MQTT DISCONNECT followed by the socket close no longer disconnects a newer connection that reused the same connection id.
 ### Security
+
+
+---
+
+## [rumqttd 0.20.1] - 30-09-2026
+
+### Fixed
+- A graceful MQTT DISCONNECT followed by the socket close no longer disconnects a newer connection that reused the same connection id.
+- A shadow request from a link whose connection was removed is no longer answered to a newer connection that reused the id, and no longer panics the router when the id is vacant.
 
 
 ---

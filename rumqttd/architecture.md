@@ -95,6 +95,8 @@ These packets are registed with the QoS1 buffer in `Connection`, and if the ack 
 
 A remote link sends this event when its network connection closes, unless the router already dropped the link. A client that sends an MQTT DISCONNECT and then closes its socket therefore produces two removals for one connection: one when the router handles the DISCONNECT packet, and one when this event arrives. Connection ids are `Slab` indices and are reused, so by the time the event arrives the id can belong to a newer, unrelated connection. The event therefore carries the link's incoming buffer, and the router removes the connection only if that buffer is the one registered at the id (`Arc::ptr_eq`). An event for a connection that is already gone, or whose id was reused, is dropped.
 
+`Event::Shadow` carries the same buffer and is checked the same way, so a shadow reply never reaches a connection that reused the id, and a request for a vacant id is dropped rather than panicking. `Event::DeviceData` and `Event::Ready` carry no identity and need none: the router drains the incoming buffer registered at the id, so packets a stale link left in its own buffer are never read, and a spurious `Ready` only reschedules a live connection.
+
 ### Ready Event
 
 When a connection's buffer is full, the router pushes an unschedule notification at the last of the buffer. So whenever the `RemoteLink` encounters unschedule notification, it sends a ready event to router to let it know that buffer has now free space for more notifications.

@@ -247,8 +247,12 @@ impl Router {
             Event::DeviceData => self.handle_device_payload(id),
             Event::Disconnect { incoming } => self.handle_link_disconnection(id, &incoming),
             Event::Ready => self.scheduler.reschedule(id, ScheduleReason::Ready),
-            Event::Shadow(request) => {
-                retrieve_shadow(&mut self.datalog, &mut self.obufs[id], request)
+            Event::Shadow { request, incoming } => {
+                if self.link_owns(id, &incoming) {
+                    retrieve_shadow(&mut self.datalog, &mut self.obufs[id], request)
+                } else {
+                    debug!(connection_id = id, "shadow request from a removed link");
+                }
             }
             Event::SendAlerts => {
                 self.send_alerts();
@@ -408,20 +412,29 @@ impl Router {
         let _alert_id = self.alerts.insert(tx);
     }
 
+    /// Whether the connection registered at `id` is the link owning `incoming`.
+    /// Connection ids are `Slab` indices: once a connection is removed, its id
+    /// can be handed to a newer, unrelated connection while events from the
+    /// old link are still queued.
+    fn link_owns(
+        &self,
+        id: ConnectionId,
+        incoming: &Arc<parking_lot::Mutex<VecDeque<Packet>>>,
+    ) -> bool {
+        self.ibufs
+            .get(id)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.buffer, incoming))
+    }
+
     /// A link reports that its network connection closed. A client that sent
     /// DISCONNECT first has already been removed, and its id may since have
-    /// been reused by a newer connection, so only remove the connection if it
-    /// is still the one owning `incoming`.
+    /// been reused, so only remove the connection if the link still owns it.
     fn handle_link_disconnection(
         &mut self,
         id: ConnectionId,
         incoming: &Arc<parking_lot::Mutex<VecDeque<Packet>>>,
     ) {
-        let owner = self
-            .ibufs
-            .get(id)
-            .is_some_and(|registered| Arc::ptr_eq(&registered.buffer, incoming));
-        if !owner {
+        if !self.link_owns(id, incoming) {
             debug!(
                 connection_id = id,
                 "link disconnect for a connection already removed"
@@ -2439,7 +2452,7 @@ mod disconnect_tests {
         router: &mut Router,
         client_id: &str,
     ) -> (ConnectionId, Arc<parking_lot::Mutex<VecDeque<Packet>>>) {
-        let connection = Connection::new(None, client_id.to_owned(), true, false);
+        let connection = Connection::new(None, client_id.to_owned(), true, true);
         let incoming = Incoming::new(client_id.to_owned());
         let link_buffer = incoming.buffer();
         let (outgoing, _link_rx) = Outgoing::new(client_id.to_owned());
@@ -2452,6 +2465,106 @@ mod disconnect_tests {
             },
         );
         (*router.connection_map.get(client_id).unwrap(), link_buffer)
+    }
+
+    /// Publishes on `topic` from connection `id` so the datalog holds a shadow
+    /// for it. The filter is created up front, as a subscription would.
+    fn publish(
+        router: &mut Router,
+        id: ConnectionId,
+        buffer: &Arc<parking_lot::Mutex<VecDeque<Packet>>>,
+        topic: &str,
+    ) {
+        router.datalog.next_native_offset(topic);
+        let publish = Publish::new(topic.to_owned(), "state".to_owned(), false);
+        buffer.lock().push_back(Packet::Publish(publish, None));
+        router.events(id, Event::DeviceData);
+    }
+
+    fn outgoing_len(router: &Router, id: ConnectionId) -> usize {
+        router.obufs[id].data_buffer.lock().len()
+    }
+
+    /// A shadow request from a link whose connection is gone must not be
+    /// answered to the newer connection that reused the id.
+    #[test]
+    fn stale_shadow_is_not_answered_to_connection_that_reused_the_id() {
+        let mut router = router();
+        let (publisher, publisher_buffer) = connect(&mut router, "publisher");
+        publish(&mut router, publisher, &publisher_buffer, "device/state");
+        assert!(router.datalog.shadow("device/state").is_some());
+
+        let (old_id, old_link_buffer) = connect(&mut router, "old");
+        router.handle_disconnection(old_id, None);
+        let (new_id, _new_link_buffer) = connect(&mut router, "new");
+        assert_eq!(new_id, old_id);
+
+        router.events(
+            old_id,
+            Event::Shadow {
+                request: ShadowRequest {
+                    filter: "device/state".to_owned(),
+                },
+                incoming: old_link_buffer,
+            },
+        );
+
+        assert_eq!(outgoing_len(&router, new_id), 0);
+    }
+
+    /// A live link's own shadow request is answered.
+    #[test]
+    fn shadow_is_answered_to_its_own_link() {
+        let mut router = router();
+        let (id, link_buffer) = connect(&mut router, "device");
+        publish(&mut router, id, &link_buffer, "device/state");
+
+        router.events(
+            id,
+            Event::Shadow {
+                request: ShadowRequest {
+                    filter: "device/state".to_owned(),
+                },
+                incoming: link_buffer,
+            },
+        );
+
+        assert_eq!(outgoing_len(&router, id), 1);
+    }
+
+    /// A shadow request for a vacant id is dropped, not a router panic.
+    #[test]
+    fn shadow_for_vacant_id_is_dropped() {
+        let mut router = router();
+        let (id, link_buffer) = connect(&mut router, "gone");
+        router.handle_disconnection(id, None);
+
+        router.events(
+            id,
+            Event::Shadow {
+                request: ShadowRequest {
+                    filter: "device/state".to_owned(),
+                },
+                incoming: link_buffer,
+            },
+        );
+    }
+
+    /// `DeviceData` carries no identity, and needs none: the router drains the
+    /// buffer registered at the id, so packets a stale link left in its own
+    /// buffer never reach the newer connection.
+    #[test]
+    fn stale_device_data_does_not_consume_old_link_packets() {
+        let mut router = router();
+        let (old_id, old_link_buffer) = connect(&mut router, "old");
+        router.handle_disconnection(old_id, None);
+        let (new_id, _new_link_buffer) = connect(&mut router, "new");
+        assert_eq!(new_id, old_id);
+
+        publish(&mut router, old_id, &old_link_buffer, "device/state");
+
+        assert_eq!(old_link_buffer.lock().len(), 1);
+        assert!(router.datalog.shadow("device/state").is_none());
     }
 
     /// A graceful DISCONNECT removes the connection once in the router, and the
