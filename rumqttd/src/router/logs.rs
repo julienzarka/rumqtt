@@ -124,9 +124,10 @@ impl DataLog {
 
     // TODO: Currently returning a Option<Vec> instead of Option<&Vec> due to Rust borrow checker
     // limitation
-    pub fn matches(&mut self, topic: &str) -> Option<Vec<usize>> {
+    /// Filter indexes matching `topic`, empty when nobody subscribed to it.
+    pub fn matches(&mut self, topic: &str) -> Vec<usize> {
         match &self.publish_filters.get(topic) {
-            Some(v) => Some(v.to_vec()),
+            Some(v) => v.to_vec(),
             None => {
                 let v: Vec<usize> = self
                     .filter_indexes
@@ -139,7 +140,7 @@ impl DataLog {
                     self.publish_filters.insert(topic.to_owned(), v.clone());
                 }
 
-                Some(v)
+                v
             }
         }
     }

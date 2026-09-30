@@ -43,8 +43,6 @@ pub enum RouterError {
     #[cfg(feature = "validate-tenant-prefix")]
     #[error("Bad Tenant")]
     BadTenant(String, String),
-    #[error("No matching filters to topic {0}")]
-    NoMatchingFilters(String),
     #[error("Invalid filter prefix {0}")]
     InvalidFilterPrefix(Filter),
     #[error("Invalid client_id {0}")]
@@ -1275,17 +1273,9 @@ fn append_to_commitlog(
     publish.retain = false;
     let pkid = publish.pkid;
 
+    // A publish with no matching filter goes nowhere: MQTT drops messages
+    // nobody subscribed to. Filters are created by subscriptions only.
     let filter_idxs = datalog.matches(topic);
-
-    // Create a dynamic filter if dynamic_filters are enabled for this connection
-    let filter_idxs = match filter_idxs {
-        Some(v) => v,
-        None if connection.dynamic_filters => {
-            let (idx, _cursor) = datalog.next_native_offset(topic);
-            vec![idx]
-        }
-        None => return Err(RouterError::NoMatchingFilters(topic.to_owned())),
-    };
 
     let mut o = (0, 0);
     for filter_idx in filter_idxs {
@@ -1347,11 +1337,6 @@ fn append_will_message(
     let pkid = publish.pkid;
 
     let filter_idxs = datalog.matches(topic);
-
-    let filter_idxs = match filter_idxs {
-        Some(v) => v,
-        None => return Err(RouterError::NoMatchingFilters(topic.to_owned())),
-    };
 
     let mut o = (0, 0);
     for filter_idx in filter_idxs {
@@ -2565,6 +2550,40 @@ mod disconnect_tests {
 
         assert_eq!(old_link_buffer.lock().len(), 1);
         assert!(router.datalog.shadow("device/state").is_none());
+    }
+
+    /// A publish to a topic nobody subscribed to is dropped, for dynamic and
+    /// static connections alike: no filter is created and the publisher stays
+    /// connected. `dynamic_filters` has no effect on the publish path.
+    #[test]
+    fn publish_without_subscriber_is_dropped_and_publisher_stays_connected() {
+        let mut router = router();
+        for dynamic_filters in [true, false] {
+            let client_id = format!("publisher-{dynamic_filters}");
+            let connection = Connection::new(None, client_id.clone(), true, dynamic_filters);
+            let incoming = Incoming::new(client_id.clone());
+            let buffer = incoming.buffer();
+            let (outgoing, _link_rx) = Outgoing::new(client_id.clone());
+            router.events(
+                0,
+                Event::Connect {
+                    connection,
+                    incoming,
+                    outgoing,
+                },
+            );
+            let id = *router.connection_map.get(&client_id).unwrap();
+
+            let publish = Publish::new("nobody/listens".to_owned(), "x".to_owned(), false);
+            buffer.lock().push_back(Packet::Publish(publish, None));
+            router.events(id, Event::DeviceData);
+
+            assert!(
+                router.connections.contains(id),
+                "{client_id} was disconnected"
+            );
+            assert!(router.datalog.shadow("nobody/listens").is_none());
+        }
     }
 
     /// A graceful DISCONNECT removes the connection once in the router, and the
