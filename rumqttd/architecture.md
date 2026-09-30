@@ -91,7 +91,9 @@ These packets are registed with the QoS1 buffer in `Connection`, and if the ack 
 
 ### Disconnect Event
 
-`Router::handle_disconnection()` is called here, as well as within data events when disconnection is required. The connection is removed, and so is corresponding acks in `Router::ackslog`. All the data requests in waiters is pushed back to tracker, and tracker itself is saved in graveyard if clean session is not asked.
+`Router::handle_link_disconnection()` is called here and delegates to `Router::handle_disconnection()`, which is also called within data events when disconnection is required. The connection is removed, and so is corresponding acks in `Router::ackslog`. All the data requests in waiters is pushed back to tracker, and tracker itself is saved in graveyard if clean session is not asked.
+
+A remote link sends this event when its network connection closes, unless the router already dropped the link. A client that sends an MQTT DISCONNECT and then closes its socket therefore produces two removals for one connection: one when the router handles the DISCONNECT packet, and one when this event arrives. Connection ids are `Slab` indices and are reused, so by the time the event arrives the id can belong to a newer, unrelated connection. The event therefore carries the link's incoming buffer, and the router removes the connection only if that buffer is the one registered at the id (`Arc::ptr_eq`). An event for a connection that is already gone, or whose id was reused, is dropped.
 
 ### Ready Event
 

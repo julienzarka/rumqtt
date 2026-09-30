@@ -712,8 +712,7 @@ async fn remote<P: Protocol>(
     };
 
     if send_disconnect {
-        let disconnect = Event::Disconnect;
-        let message = (connection_id, disconnect);
+        let message = (connection_id, link.disconnect_event());
         router_tx.send(message).ok();
     }
 

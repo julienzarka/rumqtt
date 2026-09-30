@@ -163,6 +163,13 @@ impl LinkTx {
         self.recv_buffer.lock()
     }
 
+    /// Event telling the router that this link's network connection closed.
+    pub(crate) fn disconnect_event(&self) -> Event {
+        Event::Disconnect {
+            incoming: self.recv_buffer.clone(),
+        }
+    }
+
     /// Send raw device data
     fn push(&mut self, data: Packet) -> Result<usize, LinkError> {
         let len = {

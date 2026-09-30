@@ -125,6 +125,11 @@ impl<P: Protocol> RemoteLink<P> {
         })
     }
 
+    /// Event telling the router that this link's network connection closed.
+    pub(crate) fn disconnect_event(&self) -> Event {
+        self.link_tx.disconnect_event()
+    }
+
     pub async fn start(&mut self) -> Result<(), Error> {
         self.network.set_keepalive(self.connect.keep_alive);
 

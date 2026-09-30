@@ -13,6 +13,7 @@ use flume::{bounded, Receiver, RecvError, Sender, TryRecvError};
 use slab::Slab;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::Utf8Error;
+use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -244,7 +245,7 @@ impl Router {
             Event::NewMeter(tx) => self.handle_new_meter(tx),
             Event::NewAlert(tx) => self.handle_new_alert(tx),
             Event::DeviceData => self.handle_device_payload(id),
-            Event::Disconnect => self.handle_disconnection(id, None),
+            Event::Disconnect { incoming } => self.handle_link_disconnection(id, &incoming),
             Event::Ready => self.scheduler.reschedule(id, ScheduleReason::Ready),
             Event::Shadow(request) => {
                 retrieve_shadow(&mut self.datalog, &mut self.obufs[id], request)
@@ -407,9 +408,32 @@ impl Router {
         let _alert_id = self.alerts.insert(tx);
     }
 
+    /// A link reports that its network connection closed. A client that sent
+    /// DISCONNECT first has already been removed, and its id may since have
+    /// been reused by a newer connection, so only remove the connection if it
+    /// is still the one owning `incoming`.
+    fn handle_link_disconnection(
+        &mut self,
+        id: ConnectionId,
+        incoming: &Arc<parking_lot::Mutex<VecDeque<Packet>>>,
+    ) {
+        let owner = self
+            .ibufs
+            .get(id)
+            .is_some_and(|registered| Arc::ptr_eq(&registered.buffer, incoming));
+        if !owner {
+            debug!(
+                connection_id = id,
+                "link disconnect for a connection already removed"
+            );
+            return;
+        }
+        self.handle_disconnection(id, None);
+    }
+
     fn handle_disconnection(&mut self, id: ConnectionId, reason: Option<DisconnectReasonCode>) {
-        // Some clients can choose to send Disconnect packet before network disconnection.
-        // This will lead to double Disconnect packets in router `events`
+        // A link's late socket-close event is filtered by
+        // `handle_link_disconnection`; a vacant id here is a caller bug.
         let client_id = match &self.obufs.get(id) {
             Some(v) => v.client_id.clone(),
             None => {
@@ -2393,3 +2417,87 @@ fn extract_group(filter: &str) -> Option<(String, String)> {
 // //         dbg!(trackers);
 // //     }
 // // }
+
+#[cfg(test)]
+mod disconnect_tests {
+    use super::*;
+
+    fn router() -> Router {
+        let config = RouterConfig {
+            max_connections: 10,
+            max_outgoing_packet_count: 200,
+            max_segment_size: 1024 * 1024,
+            max_segment_count: 10,
+            ..Default::default()
+        };
+        Router::new(0, config)
+    }
+
+    /// Registers `client_id` the way a link does and returns its connection id
+    /// and the incoming buffer that link keeps.
+    fn connect(
+        router: &mut Router,
+        client_id: &str,
+    ) -> (ConnectionId, Arc<parking_lot::Mutex<VecDeque<Packet>>>) {
+        let connection = Connection::new(None, client_id.to_owned(), true, false);
+        let incoming = Incoming::new(client_id.to_owned());
+        let link_buffer = incoming.buffer();
+        let (outgoing, _link_rx) = Outgoing::new(client_id.to_owned());
+        router.events(
+            0,
+            Event::Connect {
+                connection,
+                incoming,
+                outgoing,
+            },
+        );
+        (*router.connection_map.get(client_id).unwrap(), link_buffer)
+    }
+
+    /// A graceful DISCONNECT removes the connection once in the router, and the
+    /// link's socket close sends a second `Event::Disconnect` for the same id.
+    /// If a newer connection took the freed slab id in between, that stale
+    /// event must not remove it.
+    #[test]
+    fn stale_disconnect_does_not_remove_connection_that_reused_the_id() {
+        let mut router = router();
+        let (old_id, old_link_buffer) = connect(&mut router, "old");
+
+        // DISCONNECT packet handled by the router.
+        router.handle_disconnection(old_id, None);
+        let (new_id, _new_link_buffer) = connect(&mut router, "new");
+        assert_eq!(
+            new_id, old_id,
+            "slab must hand the freed id to the next connection"
+        );
+
+        // Socket close of "old" arrives late.
+        router.events(
+            old_id,
+            Event::Disconnect {
+                incoming: old_link_buffer,
+            },
+        );
+
+        assert_eq!(router.connection_map.get("new"), Some(&new_id));
+        assert!(router.connections.contains(new_id));
+    }
+
+    /// A link whose client closed the socket without DISCONNECT is still
+    /// removed by its own `Event::Disconnect`.
+    #[test]
+    fn link_disconnect_removes_its_own_connection() {
+        let mut router = router();
+        let (id, link_buffer) = connect(&mut router, "abrupt");
+
+        router.events(
+            id,
+            Event::Disconnect {
+                incoming: link_buffer,
+            },
+        );
+
+        assert!(!router.connection_map.contains_key("abrupt"));
+        assert!(!router.connections.contains(id));
+    }
+}

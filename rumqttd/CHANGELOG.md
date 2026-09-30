@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 ### Deprecated
 ### Removed
-### Fixed 
+### Fixed
+- A graceful MQTT DISCONNECT followed by the socket close no longer disconnects a newer connection that reused the same connection id.
 ### Security
 
 

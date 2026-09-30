@@ -53,8 +53,13 @@ pub enum Event {
     Ready,
     /// Data for native commitlog
     DeviceData,
-    /// Disconnection request
-    Disconnect,
+    /// The link's network connection closed. Carries the link's incoming
+    /// buffer so the router can tell whether the connection registered at this
+    /// id is still the one that sent the event: the id is a `Slab` index and
+    /// may already belong to a newer connection.
+    Disconnect {
+        incoming: std::sync::Arc<parking_lot::Mutex<VecDeque<Packet>>>,
+    },
     /// Shadow
     Shadow(ShadowRequest),
     /// Collect and send alerts to all alerts links
