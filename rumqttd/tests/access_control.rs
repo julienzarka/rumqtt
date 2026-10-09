@@ -119,7 +119,17 @@ struct Will<'a> {
 }
 
 fn connect(version: u8, id: &str, login: Option<(&str, &str)>, will: Option<Will>) -> Vec<u8> {
-    let mut flags = 0x02;
+    connect_session(version, id, login, will, true)
+}
+
+fn connect_session(
+    version: u8,
+    id: &str,
+    login: Option<(&str, &str)>,
+    will: Option<Will>,
+    clean: bool,
+) -> Vec<u8> {
+    let mut flags = if clean { 0x02 } else { 0x00 };
     if will.is_some() {
         flags |= 0x04;
     }
@@ -466,6 +476,66 @@ fn a_second_connect_cannot_change_the_identity_of_a_connection() {
             assert!(
                 alice.maybe_packet().await.is_none(),
                 "identity changed after CONNECT"
+            );
+        }
+    });
+}
+
+/// CONNECT with `clean_session = false`: the CONNACK (session-present flag) and
+/// the connection.
+async fn persistent(port: u16, id: &str, user: &str, pass: &str) -> Option<(Conn, bool)> {
+    let packet = connect_session(4, id, Some((user, pass)), None, false);
+    let (c, ack) = Conn::open(port, packet).await?;
+    accepted(&ack).then(|| (c, ack.get(2).is_some_and(|f| f & 1 == 1)))
+}
+
+#[test]
+fn a_persistent_session_cannot_be_resumed_or_drained_by_another_principal() {
+    run(|p4, _| {
+        async move {
+            // Alice's persistent session subscribes, then goes away.
+            let (mut a, resumed) = persistent(p4, "sess", "alice", "pw-a")
+                .await
+                .expect("alice");
+            assert!(!resumed);
+            assert_eq!(suback_code(&mut a, 4, 1, "alice/q").await & 0x80, 0);
+            a.send(&[0xe0, 0x00]).await;
+            drop(a);
+
+            // A message is queued for her while she is offline.
+            let mut feeder = login(p4, 4, "feeder", "alice", "pw-a")
+                .await
+                .expect("feeder");
+            feeder
+                .send(&publish(4, "alice/q", false, "for-alice-only"))
+                .await;
+            puback(&mut feeder).await;
+
+            // Bob connects with the same client id and clean_session = false: he
+            // gets a session of his own, not hers, and none of her messages.
+            let (mut b, resumed) = persistent(p4, "sess", "bob", "pw-b").await.expect("bob");
+            assert!(!resumed, "bob resumed alice's session");
+            assert!(
+                b.maybe_packet().await.is_none(),
+                "bob received alice's queued message"
+            );
+            // He holds none of her subscriptions either.
+            feeder.send(&publish(4, "alice/q", false, "second")).await;
+            puback(&mut feeder).await;
+            assert!(
+                b.maybe_packet().await.is_none(),
+                "bob inherited alice's subscription"
+            );
+
+            // Alice still has her session and her queued messages.
+            let (mut a2, resumed) = persistent(p4, "sess", "alice", "pw-a")
+                .await
+                .expect("alice again");
+            assert!(resumed, "alice lost her own session");
+            let got = a2.read_packet().await.expect("queued message");
+            assert!(
+                String::from_utf8_lossy(&got).contains("for-alice-only"),
+                "{got:?}"
             );
         }
     });
