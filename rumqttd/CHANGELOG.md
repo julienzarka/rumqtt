@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [rumqttd 0.20.2] - 09-10-2026
+
+### Added
+- `AccessControl`: an embedder-supplied authenticator that binds a principal to each remote connection, plus a per-publish authorizer. A denied publish is dropped (still acked) before it is retained or fanned out; a CONNECT whose last will the principal could not publish is refused. In-process links carry no principal and are never checked. Installed through `Config::access_control`.
+
+---
+
 ## [rumqttd 0.20.1] - 30-09-2026
 
 ### Fixed

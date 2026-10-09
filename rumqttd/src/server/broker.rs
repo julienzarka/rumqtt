@@ -120,9 +120,21 @@ pub struct Broker {
 
 impl Broker {
     pub fn new(config: Config) -> Broker {
+        let mut config = config;
+        if let Some(access) = config.access_control.clone() {
+            for servers in [&mut config.v4, &mut config.v5, &mut config.ws] {
+                for server in servers.iter_mut().flat_map(|s| s.values_mut()) {
+                    server
+                        .connections
+                        .access_control
+                        .get_or_insert_with(|| access.clone());
+                }
+            }
+        }
         let config = Arc::new(config);
         let router_config = config.router.clone();
-        let router: Router = Router::new(config.id, router_config);
+        let mut router: Router = Router::new(config.id, router_config);
+        router.set_access_control(config.access_control.clone());
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let shutdown_tx = Arc::new(shutdown_tx);
 
@@ -624,7 +636,7 @@ async fn remote<P: Protocol>(
 
     let dynamic_filters = config.dynamic_filters;
 
-    let connect_packet = match mqtt_connect(config, &mut network).await {
+    let (connect_packet, principal) = match mqtt_connect(config, &mut network).await {
         Ok(p) => p,
         Err(e) => {
             error!(error=?e, "Error while handling MQTT connect packet");
@@ -676,6 +688,7 @@ async fn remote<P: Protocol>(
         connect_packet,
         dynamic_filters,
         assigned_client_id,
+        principal,
     )
     .await
     {

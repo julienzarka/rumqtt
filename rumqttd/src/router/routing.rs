@@ -101,9 +101,16 @@ pub struct Router {
     shared_subscriptions: HashMap<String, SharedGroup>,
     /// Will messages per client_id
     last_wills: HashMap<String, (LastWill, Option<LastWillProperties>)>,
+    /// Per-publish authorization for connections that carry a principal
+    access_control: Option<AccessControlRef>,
 }
 
 impl Router {
+    /// Install the per-publish authorizer. Call before [`Router::spawn`].
+    pub fn set_access_control(&mut self, access_control: Option<AccessControlRef>) {
+        self.access_control = access_control;
+    }
+
     pub fn new(router_id: RouterId, config: RouterConfig) -> Router {
         let (router_tx, router_rx) = bounded(1000);
 
@@ -142,6 +149,7 @@ impl Router {
             cache: Some(VecDeque::with_capacity(MAX_CHANNEL_CAPACITY)),
             shared_subscriptions: HashMap::new(),
             last_wills: HashMap::new(),
+            access_control: None,
         }
     }
 
@@ -650,6 +658,7 @@ impl Router {
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
+                        self.access_control.as_ref(),
                     ) {
                         Ok(_offset) => {
                             // Even if one of the data in the batch is appended to commitlog,
@@ -861,6 +870,7 @@ impl Router {
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
+                        self.access_control.as_ref(),
                     ) {
                         Ok(_offset) => {
                             // Even if one of the data in the batch is appended to commitlog,
@@ -1226,6 +1236,7 @@ fn append_to_commitlog(
     datalog: &mut DataLog,
     notifications: &mut VecDeque<(ConnectionId, DataRequest)>,
     connections: &mut Slab<Connection>,
+    access_control: Option<&AccessControlRef>,
 ) -> Result<Offset, RouterError> {
     let connection = connections.get_mut(id).unwrap();
 
@@ -1259,6 +1270,15 @@ fn append_to_commitlog(
                 tenant_prefix.to_owned(),
                 topic.to_owned(),
             ));
+        }
+    }
+
+    // A denied publish is dropped before it is retained or fanned out. The
+    // sender is still acked: MQTT 3.1.1 cannot refuse a single PUBLISH.
+    if let (Some(access), Some(principal)) = (access_control, &connection.principal) {
+        if !access.can_publish(principal, topic, &publish.payload) {
+            trace!(%principal, topic, "publish denied by access control");
+            return Ok((0, 0));
         }
     }
 
@@ -2468,6 +2488,71 @@ mod disconnect_tests {
 
     fn outgoing_len(router: &Router, id: ConnectionId) -> usize {
         router.obufs[id].data_buffer.lock().len()
+    }
+
+    /// Principals may publish only under `<principal>/`.
+    #[derive(Debug)]
+    struct OwnTopicsOnly;
+
+    impl AccessControl for OwnTopicsOnly {
+        fn authenticate(&self, _: &str, _: &str, _: &str) -> PrincipalFuture {
+            Box::pin(async { None })
+        }
+
+        fn can_publish(&self, principal: &str, topic: &str, _: &[u8]) -> bool {
+            topic.starts_with(&format!("{principal}/"))
+        }
+    }
+
+    fn connect_as(
+        router: &mut Router,
+        client_id: &str,
+        principal: Option<&str>,
+    ) -> (ConnectionId, Arc<parking_lot::Mutex<VecDeque<Packet>>>) {
+        let connection = Connection::new(None, client_id.to_owned(), true, true)
+            .with_principal(principal.map(str::to_owned));
+        let incoming = Incoming::new(client_id.to_owned());
+        let link_buffer = incoming.buffer();
+        let (outgoing, _link_rx) = Outgoing::new(client_id.to_owned());
+        router.events(
+            0,
+            Event::Connect {
+                connection,
+                incoming,
+                outgoing,
+            },
+        );
+        (*router.connection_map.get(client_id).unwrap(), link_buffer)
+    }
+
+    /// A principal's publish outside its own namespace never reaches the
+    /// datalog; inside it, it does. An in-process link (no principal) is
+    /// never checked.
+    #[test]
+    fn access_control_drops_publish_outside_principal_namespace() {
+        let mut router = router();
+        router.set_access_control(Some(Arc::new(OwnTopicsOnly)));
+        let (a, a_buf) = connect_as(&mut router, "client-a", Some("a"));
+        let (local, local_buf) = connect_as(&mut router, "in-process", None);
+
+        publish(&mut router, a, &a_buf, "b/state");
+        assert!(router.datalog.shadow("b/state").is_none(), "forged publish");
+        assert!(router.connections.contains(a), "publisher is not kicked");
+
+        publish(&mut router, a, &a_buf, "a/state");
+        assert!(router.datalog.shadow("a/state").is_some());
+
+        publish(&mut router, local, &local_buf, "b/state");
+        assert!(router.datalog.shadow("b/state").is_some());
+    }
+
+    /// Without an installed access control a principal is inert.
+    #[test]
+    fn principal_without_access_control_is_unrestricted() {
+        let mut router = router();
+        let (a, a_buf) = connect_as(&mut router, "client-a", Some("a"));
+        publish(&mut router, a, &a_buf, "b/state");
+        assert!(router.datalog.shadow("b/state").is_some());
     }
 
     /// A shadow request from a link whose connection is gone must not be

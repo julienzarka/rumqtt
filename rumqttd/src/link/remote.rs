@@ -68,6 +68,7 @@ impl<P: Protocol> RemoteLink<P> {
         connect_packet: Packet,
         dynamic_filters: bool,
         assigned_client_id: Option<String>,
+        principal: Option<String>,
     ) -> Result<RemoteLink<P>, Error> {
         let Packet::Connect(connect, props, lastwill, lastwill_props, _) = connect_packet else {
             return Err(Error::NotConnectPacket(connect_packet));
@@ -95,6 +96,7 @@ impl<P: Protocol> RemoteLink<P> {
 
         let (link_tx, link_rx, notification) = LinkBuilder::new(client_id, router_tx)
             .tenant_id(tenant_id)
+            .principal(principal)
             .clean_session(clean_session)
             .last_will(lastwill)
             .last_will_properties(lastwill_props)
@@ -179,7 +181,7 @@ impl<P: Protocol> RemoteLink<P> {
 pub async fn mqtt_connect<P>(
     config: Arc<ConnectionSettings>,
     network: &mut Network<P>,
-) -> Result<Packet, Error>
+) -> Result<(Packet, Option<String>), Error>
 where
     P: Protocol,
 {
@@ -193,14 +195,28 @@ where
     })
     .await??;
 
-    let (connect, _props, login) = match packet {
-        Packet::Connect(ref connect, ref props, _, _, ref login) => (connect, props, login),
+    let (connect, _props, lastwill, login) = match packet {
+        Packet::Connect(ref connect, ref props, ref lastwill, _, ref login) => {
+            (connect, props, lastwill, login)
+        }
         packet => return Err(Error::NotConnectPacket(packet)),
     };
 
     Span::current().record("client_id", &connect.client_id);
 
-    handle_auth(config.clone(), login.as_ref(), &connect.client_id).await?;
+    let principal = authenticate(&config, login.as_ref(), &connect.client_id).await?;
+
+    // A will is published by the router after the client is gone, outside the
+    // per-publish check: refuse a CONNECT whose will the principal could not
+    // have published itself.
+    if let (Some(access), Some(principal), Some(will)) =
+        (&config.access_control, &principal, lastwill)
+    {
+        let topic = String::from_utf8_lossy(&will.topic);
+        if !access.can_publish(principal, &topic, &will.message) {
+            return Err(Error::InvalidAuth);
+        }
+    }
 
     // When keep_alive feature is disabled client can live forever, which is not good in
     // distributed broker context so currenlty we don't allow it.
@@ -224,7 +240,31 @@ where
     }
 
     // Ok((connect, props, lastwill, lastwill_props))
-    Ok(packet)
+    Ok((packet, principal))
+}
+
+/// Resolve the principal for a CONNECT: the embedder's [`crate::AccessControl`]
+/// when installed, else the legacy `auth` / `external_auth` check (which binds
+/// no principal).
+async fn authenticate(
+    config: &Arc<ConnectionSettings>,
+    login: Option<&Login>,
+    client_id: &str,
+) -> Result<Option<String>, Error> {
+    let Some(access) = &config.access_control else {
+        handle_auth(config.clone(), login, client_id).await?;
+        return Ok(None);
+    };
+    let Some(login) = login else {
+        return Err(Error::InvalidAuth);
+    };
+    match access
+        .authenticate(client_id, &login.username, &login.password)
+        .await
+    {
+        Some(principal) => Ok(Some(principal)),
+        None => Err(Error::InvalidAuth),
+    }
 }
 
 async fn handle_auth(
@@ -287,6 +327,7 @@ mod tests {
             max_inflight_count: 0,
             auth: None,
             external_auth: None,
+            access_control: None,
             dynamic_filters: false,
         }
     }
@@ -383,5 +424,41 @@ mod tests {
         let mut cfg = config();
         cfg.set_auth_handler(closure);
         cfg.set_auth_handler(fnptr);
+    }
+
+    #[derive(Debug)]
+    struct Fixed;
+
+    impl crate::AccessControl for Fixed {
+        fn authenticate(&self, _: &str, user: &str, pass: &str) -> crate::PrincipalFuture {
+            let ok = (user == "alice" && pass == "pw").then(|| "alice".to_owned());
+            Box::pin(async move { ok })
+        }
+
+        fn can_publish(&self, _: &str, _: &str, _: &[u8]) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn access_control_binds_principal_and_refuses_bad_login() {
+        let mut cfg = config();
+        cfg.access_control = Some(Arc::new(Fixed));
+        let cfg = Arc::new(cfg);
+
+        let good = Login {
+            username: "alice".to_owned(),
+            password: "pw".to_owned(),
+        };
+        let bad = Login {
+            username: "alice".to_owned(),
+            password: "nope".to_owned(),
+        };
+        assert_eq!(
+            super::authenticate(&cfg, Some(&good), "c").await.unwrap(),
+            Some("alice".to_owned())
+        );
+        assert!(super::authenticate(&cfg, Some(&bad), "c").await.is_err());
+        assert!(super::authenticate(&cfg, None, "c").await.is_err());
     }
 }

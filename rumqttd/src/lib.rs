@@ -18,6 +18,7 @@ use tracing_subscriber::{
     Registry,
 };
 
+pub use access::{AccessControl, AccessControlRef, PrincipalFuture};
 pub use link::alerts;
 pub use link::local;
 pub use link::meters;
@@ -27,6 +28,7 @@ pub use server::{Broker, LinkType, Server, ShutdownHandle};
 
 pub use self::router::shared_subs::Strategy;
 
+mod access;
 mod link;
 pub mod protocol;
 mod router;
@@ -63,6 +65,11 @@ pub struct Config {
     pub bridge: Option<BridgeConfig>,
     pub prometheus: Option<PrometheusSetting>,
     pub metrics: Option<HashMap<MetricType, MetricSettings>>,
+    /// Authenticates remote clients to a principal and authorizes their
+    /// publishes. Set by the embedder; copied into every listener by
+    /// [`Broker::new`]. See [`AccessControl`].
+    #[serde(skip)]
+    pub access_control: Option<AccessControlRef>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -217,6 +224,9 @@ pub struct ConnectionSettings {
     pub auth: Option<HashMap<String, String>>,
     #[serde(skip)]
     pub external_auth: Option<AuthHandler>,
+    /// Takes precedence over `auth` and `external_auth` when set.
+    #[serde(skip)]
+    pub access_control: Option<AccessControlRef>,
     #[serde(default)]
     pub dynamic_filters: bool,
 }
@@ -243,6 +253,7 @@ impl fmt::Debug for ConnectionSettings {
             .field("max_inflight_count", &self.max_inflight_count)
             .field("auth", &self.auth)
             .field("external_auth", &self.external_auth.is_some())
+            .field("access_control", &self.access_control.is_some())
             .field("dynamic_filters", &self.dynamic_filters)
             .finish()
     }

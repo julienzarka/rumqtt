@@ -15,6 +15,9 @@ pub struct Connection {
     pub client_id: String,
     /// Id of client's organisation/tenant and the prefix associated with tenant's MQTT topic
     pub tenant_prefix: Option<String>,
+    /// Identity the [`crate::AccessControl`] handler authenticated this
+    /// connection as. `None` for in-process links, which are trusted.
+    pub principal: Option<String>,
     /// Dynamically create subscription filters incase they didn't exist during a publish
     pub dynamic_filters: bool,
     /// Clean session
@@ -36,6 +39,12 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Bind the authenticated principal to this connection.
+    pub fn with_principal(mut self, principal: Option<String>) -> Connection {
+        self.principal = principal;
+        self
+    }
+
     /// Create connection state to hold identifying information of connecting device
     pub fn new(
         tenant_id: Option<String>,
@@ -57,6 +66,7 @@ impl Connection {
         Connection {
             client_id,
             tenant_prefix,
+            principal: None,
             dynamic_filters,
             clean,
             subscriptions: HashSet::default(),

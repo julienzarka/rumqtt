@@ -39,6 +39,7 @@ pub enum LinkError {
 // used to build LinkTx and LinkRx
 pub struct LinkBuilder<'a> {
     tenant_id: Option<String>,
+    principal: Option<String>,
     client_id: &'a str,
     router_tx: Sender<(ConnectionId, Event)>,
     // true by default
@@ -57,6 +58,7 @@ impl<'a> LinkBuilder<'a> {
             client_id,
             router_tx,
             tenant_id: None,
+            principal: None,
             clean_session: true,
             last_will: None,
             last_will_properties: None,
@@ -67,6 +69,11 @@ impl<'a> LinkBuilder<'a> {
 
     pub fn tenant_id(mut self, tenant_id: Option<String>) -> Self {
         self.tenant_id = tenant_id;
+        self
+    }
+
+    pub fn principal(mut self, principal: Option<String>) -> Self {
+        self.principal = principal;
         self
     }
 
@@ -106,7 +113,8 @@ impl<'a> LinkBuilder<'a> {
             self.client_id.to_owned(),
             self.clean_session,
             self.dynamic_filters,
-        );
+        )
+        .with_principal(self.principal);
 
         connection
             .last_will(self.last_will, self.last_will_properties)
