@@ -25,6 +25,13 @@ pub trait AccessControl: Send + Sync + fmt::Debug {
     /// will, which refuses the CONNECT when denied. Runs on the router thread:
     /// keep it cheap and non-blocking.
     fn can_publish(&self, principal: &str, topic: &str, payload: &[u8]) -> bool;
+
+    /// May `principal` subscribe to `filter` (the raw filter of the SUBSCRIBE,
+    /// including a `$share/<group>/` prefix and any wildcards)? A `false` is
+    /// answered with a failure return code for that filter and no subscription
+    /// is made, so no retained message is delivered either. The connection
+    /// stays up. Same threading rules as [`can_publish`](Self::can_publish).
+    fn can_subscribe(&self, principal: &str, filter: &str) -> bool;
 }
 
 pub type AccessControlRef = Arc<dyn AccessControl>;

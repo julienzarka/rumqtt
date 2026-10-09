@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `AccessControl`: an embedder-supplied authenticator that binds a principal to each remote connection, plus a per-publish authorizer. A denied publish is dropped (still acked) before it is retained or fanned out; a CONNECT whose last will the principal could not publish is refused. In-process links carry no principal and are never checked. Installed through `Config::access_control`.
+- `AccessControl::can_subscribe`: a SUBSCRIBE filter (wildcards and `$share/` included) the principal may not use gets a failure return code, no subscription and no retained delivery; the connection stays up.
+
+### Security
+- With `AccessControl`, a client-chosen client id is prefixed with the authenticated principal inside the router, so one principal can no longer take over another's connection or persistent session, or fire or cancel its pending will, by connecting with the same client id.
 
 ---
 

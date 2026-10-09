@@ -709,6 +709,21 @@ impl Router {
                             break;
                         }
 
+                        // Checked against the principal bound at CONNECT, on the raw
+                        // filter, before any subscription state (or retained
+                        // delivery) is created for it.
+                        let denied = match (&self.access_control, &connection.principal) {
+                            (Some(access), Some(principal)) => {
+                                !access.can_subscribe(principal, &f.path)
+                            }
+                            _ => false,
+                        };
+                        if denied {
+                            trace!(filter = %f.path, "subscription denied by access control");
+                            return_codes.push(SubscribeReasonCode::Failure);
+                            continue;
+                        }
+
                         let mut filter = f.path.clone();
                         let mut group = None;
 
@@ -2501,6 +2516,10 @@ mod disconnect_tests {
 
         fn can_publish(&self, principal: &str, topic: &str, _: &[u8]) -> bool {
             topic.starts_with(&format!("{principal}/"))
+        }
+
+        fn can_subscribe(&self, principal: &str, filter: &str) -> bool {
+            filter.starts_with(&format!("{principal}/")) && !filter.contains('#')
         }
     }
 

@@ -438,6 +438,10 @@ mod tests {
         fn can_publish(&self, _: &str, _: &str, _: &[u8]) -> bool {
             true
         }
+
+        fn can_subscribe(&self, _: &str, _: &str) -> bool {
+            true
+        }
     }
 
     #[tokio::test]

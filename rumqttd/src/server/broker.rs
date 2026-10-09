@@ -614,6 +614,13 @@ impl Callback for WSCallback {
     }
 }
 
+/// `<principal>:<client id>`. `$` is rejected in router client ids, and no
+/// legitimate principal may collide with the namespace of another, so the
+/// principal's `$` is spelled `!`: a principal name never contains `!`.
+fn namespaced_client_id(principal: &str, client_id: &str) -> String {
+    format!("{}:{client_id}", principal.replace('$', "!"))
+}
+
 /// A new network connection should wait for a mqtt connect packet. This should be handled
 /// asynchronously to avoid blocking other new connections while this connection is
 /// waiting for mqtt connect packet. Also this honours connection wait time as per config to prevent
@@ -650,6 +657,18 @@ async fn remote<P: Protocol>(
         }
         _ => unreachable!(),
     };
+
+    // Client ids are the router's session, takeover and will keys. Prefix a
+    // client-chosen id with the authenticated principal, so one principal can
+    // neither take over another's connection or persistent session, nor fire or
+    // cancel its pending will, by claiming the same id.
+    let mut connect_packet = connect_packet;
+    if let (Some(principal), false) = (&principal, client_id.is_empty()) {
+        client_id = namespaced_client_id(principal, &client_id);
+        if let Packet::Connect(connect, _, _, _, _) = &mut connect_packet {
+            connect.client_id = client_id.clone();
+        }
+    }
 
     let mut assigned_client_id = None;
     if client_id.is_empty() {
