@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [rumqttd 0.20.3] - 15-10-2026
+
+### Changed
+- With `AccessControl`, a CONNECT that carries no login is no longer refused by the router before the embedder is asked. It is passed to `AccessControl::authenticate` with an empty username and password, so the embedder chooses between an anonymous principal and a refusal. An embedder that refused the empty login already (or never admitted it) sees the same outcome. Without `AccessControl` nothing changes: `auth` and `external_auth` still refuse a login-less CONNECT.
+
 ## [rumqttd 0.20.2] - 09-10-2026
 
 ### Added

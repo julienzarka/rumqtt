@@ -46,8 +46,37 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Admits a login-less CONNECT as `$anon`, which may publish only under `anon/`.
+#[derive(Debug)]
+struct OpenToAnonymous;
+
+impl AccessControl for OpenToAnonymous {
+    fn authenticate(&self, _client_id: &str, user: &str, pass: &str) -> PrincipalFuture {
+        let principal = match (user, pass) {
+            ("", "") => Some("$anon".to_owned()),
+            ("alice", "pw-a") => Some("alice".to_owned()),
+            _ => None,
+        };
+        Box::pin(async move { principal })
+    }
+
+    fn can_publish(&self, principal: &str, topic: &str, _payload: &[u8]) -> bool {
+        let root = principal.trim_start_matches('$');
+        topic.starts_with(&format!("{root}/"))
+    }
+
+    fn can_subscribe(&self, principal: &str, filter: &str) -> bool {
+        let root = principal.trim_start_matches('$');
+        filter.starts_with(&format!("{root}/")) && !filter.contains(['#', '+'])
+    }
+}
+
 /// Returns `(v4 port, v5 port)`.
 fn start_broker() -> (u16, u16) {
+    start_broker_with(Arc::new(Users))
+}
+
+fn start_broker_with(access: Arc<dyn AccessControl>) -> (u16, u16) {
     let (p4, p5) = (free_port(), free_port());
     let toml = format!(
         r#"
@@ -84,7 +113,7 @@ dynamic_filters = true
         .expect("build config")
         .try_deserialize()
         .expect("deserialize config");
-    config.access_control = Some(Arc::new(Users));
+    config.access_control = Some(access);
     std::thread::spawn(move || {
         let mut broker = Broker::new(config);
         broker.start().expect("broker start");
@@ -252,7 +281,14 @@ async fn puback(c: &mut Conn) {
 }
 
 fn run<F: Future<Output = ()>>(test: impl FnOnce(u16, u16) -> F) {
-    let (p4, p5) = start_broker();
+    run_with(Arc::new(Users), test);
+}
+
+fn run_with<F: Future<Output = ()>>(
+    access: Arc<dyn AccessControl>,
+    test: impl FnOnce(u16, u16) -> F,
+) {
+    let (p4, p5) = start_broker_with(access);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -284,6 +320,38 @@ fn a_connect_without_valid_credentials_is_refused_on_every_listener() {
                     "v{v} valid"
                 );
             }
+        }
+    });
+}
+
+/// A CONNECT with no login reaches `AccessControl::authenticate` as an empty
+/// username and password, so the embedder decides whether it is anonymous. The
+/// router no longer refuses it first.
+#[test]
+fn a_login_less_connect_is_the_embedders_to_admit_or_refuse() {
+    run_with(Arc::new(OpenToAnonymous), |p4, p5| async move {
+        for (port, v) in [(p4, 4u8), (p5, 5u8)] {
+            let (mut anon, ack) = Conn::open(port, connect(v, "anon-c", None, None))
+                .await
+                .expect("connack");
+            assert!(accepted(&ack), "v{v} anonymous is admitted by the embedder");
+            // Bound to `$anon`: its own subtree only.
+            assert_eq!(suback_code(&mut anon, v, 1, "anon/x").await < 0x80, true);
+            assert!(suback_code(&mut anon, v, 2, "alice/x").await >= 0x80);
+            // A named user with the wrong password is still refused.
+            assert!(login(port, v, "c", "alice", "nope").await.is_none());
+            assert!(login(port, v, "c", "alice", "pw-a").await.is_some());
+        }
+    });
+}
+
+/// The embedder that refuses the empty login keeps the old outcome.
+#[test]
+fn a_login_less_connect_is_still_refused_when_the_embedder_refuses_it() {
+    run(|p4, p5| async move {
+        for (port, v) in [(p4, 4u8), (p5, 5u8)] {
+            let anon = Conn::open(port, connect(v, "c", None, None)).await;
+            assert!(anon.map_or(true, |(_, ack)| !accepted(&ack)), "v{v}");
         }
     });
 }

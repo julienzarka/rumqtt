@@ -244,8 +244,10 @@ where
 }
 
 /// Resolve the principal for a CONNECT: the embedder's [`crate::AccessControl`]
-/// when installed, else the legacy `auth` / `external_auth` check (which binds
-/// no principal).
+/// when installed (a CONNECT without a login is passed to it as an empty
+/// username and password), else the legacy `auth` / `external_auth` check
+/// (which binds no principal and refuses a CONNECT without a login when either
+/// is configured).
 async fn authenticate(
     config: &Arc<ConnectionSettings>,
     login: Option<&Login>,
@@ -255,13 +257,11 @@ async fn authenticate(
         handle_auth(config.clone(), login, client_id).await?;
         return Ok(None);
     };
-    let Some(login) = login else {
-        return Err(Error::InvalidAuth);
-    };
-    match access
-        .authenticate(client_id, &login.username, &login.password)
-        .await
-    {
+    // A CONNECT without a login is the empty login: the embedder decides
+    // whether it is an anonymous principal or a refusal, the same way it
+    // decides for any other username it does not know.
+    let (username, password) = login.map_or(("", ""), |l| (&*l.username, &*l.password));
+    match access.authenticate(client_id, username, password).await {
         Some(principal) => Ok(Some(principal)),
         None => Err(Error::InvalidAuth),
     }
@@ -463,6 +463,93 @@ mod tests {
             Some("alice".to_owned())
         );
         assert!(super::authenticate(&cfg, Some(&bad), "c").await.is_err());
+        // Fixed refuses the empty login, so a login-less CONNECT is still refused.
         assert!(super::authenticate(&cfg, None, "c").await.is_err());
+    }
+
+    /// Admits the empty login as an anonymous principal and records what it was
+    /// asked, so a test can tell "refused by the router" from "refused by the
+    /// embedder".
+    #[derive(Debug, Default)]
+    struct Anonymous {
+        asked: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl crate::AccessControl for Anonymous {
+        fn authenticate(&self, client_id: &str, user: &str, pass: &str) -> crate::PrincipalFuture {
+            if let Ok(mut asked) = self.asked.lock() {
+                asked.push((client_id.to_owned(), user.to_owned(), pass.to_owned()));
+            }
+            let principal = match (user, pass) {
+                ("", "") => Some("$anon".to_owned()),
+                ("alice", "pw") => Some("alice".to_owned()),
+                _ => None,
+            };
+            Box::pin(async move { principal })
+        }
+
+        fn can_publish(&self, _: &str, _: &str, _: &[u8]) -> bool {
+            true
+        }
+
+        fn can_subscribe(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_less_connect_reaches_the_embedder_as_an_empty_login() {
+        let access = Arc::new(Anonymous::default());
+        let mut cfg = config();
+        cfg.access_control = Some(access.clone());
+        let cfg = Arc::new(cfg);
+
+        let who = super::authenticate(&cfg, None, "c-1").await;
+        assert_eq!(who.unwrap(), Some("$anon".to_owned()));
+        assert_eq!(
+            access.asked.lock().unwrap().clone(),
+            vec![("c-1".to_owned(), String::new(), String::new())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_embedder_still_refuses_what_it_does_not_admit() {
+        let mut cfg = config();
+        cfg.access_control = Some(Arc::new(Anonymous::default()));
+        let cfg = Arc::new(cfg);
+        let bad = Login {
+            username: "alice".to_owned(),
+            password: "nope".to_owned(),
+        };
+        assert!(super::authenticate(&cfg, Some(&bad), "c").await.is_err());
+        let good = Login {
+            username: "alice".to_owned(),
+            password: "pw".to_owned(),
+        };
+        assert_eq!(
+            super::authenticate(&cfg, Some(&good), "c").await.unwrap(),
+            Some("alice".to_owned())
+        );
+    }
+
+    /// Without an `AccessControl` nothing changes: a login-less CONNECT is
+    /// refused when `auth` or `external_auth` is configured, accepted when
+    /// neither is, and in both cases binds no principal.
+    #[tokio::test]
+    async fn without_access_control_a_login_less_connect_keeps_the_legacy_rule() {
+        let open = Arc::new(config());
+        assert_eq!(super::authenticate(&open, None, "c").await.unwrap(), None);
+
+        let mut with_static = config();
+        with_static.auth = Some(HashMap::from([("u".to_owned(), "p".to_owned())]));
+        assert!(super::authenticate(&Arc::new(with_static), None, "c")
+            .await
+            .is_err());
+
+        let mut with_external = config();
+        with_external.set_auth_handler(|_: String, _: String, _: String| async { true });
+        assert!(super::authenticate(&Arc::new(with_external), None, "c")
+            .await
+            .is_err());
     }
 }

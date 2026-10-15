@@ -16,7 +16,10 @@ pub type PrincipalFuture = Pin<Box<dyn Future<Output = Option<String>> + Send>>;
 
 pub trait AccessControl: Send + Sync + fmt::Debug {
     /// Authenticate a CONNECT. `Some(principal)` admits the client and binds
-    /// that principal to the connection for its lifetime.
+    /// that principal to the connection for its lifetime. A CONNECT that
+    /// carries no login arrives here as an empty `username` and `password`, so
+    /// the embedder chooses between an anonymous principal and a refusal; an
+    /// embedder that wants every client named must return `None` for it.
     fn authenticate(&self, client_id: &str, username: &str, password: &str) -> PrincipalFuture;
 
     /// May `principal` publish `payload` on `topic`? A `false` drops the
