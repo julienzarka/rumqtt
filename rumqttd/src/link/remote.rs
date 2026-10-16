@@ -10,6 +10,7 @@ use flume::{RecvError, SendError, Sender, TrySendError};
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -181,6 +182,7 @@ impl<P: Protocol> RemoteLink<P> {
 pub async fn mqtt_connect<P>(
     config: Arc<ConnectionSettings>,
     network: &mut Network<P>,
+    peer: Option<SocketAddr>,
 ) -> Result<(Packet, Option<String>), Error>
 where
     P: Protocol,
@@ -204,7 +206,7 @@ where
 
     Span::current().record("client_id", &connect.client_id);
 
-    let principal = authenticate(&config, login.as_ref(), &connect.client_id).await?;
+    let principal = authenticate(&config, peer, login.as_ref(), &connect.client_id).await?;
 
     // A will is published by the router after the client is gone, outside the
     // per-publish check: refuse a CONNECT whose will the principal could not
@@ -250,6 +252,7 @@ where
 /// is configured).
 async fn authenticate(
     config: &Arc<ConnectionSettings>,
+    peer: Option<SocketAddr>,
     login: Option<&Login>,
     client_id: &str,
 ) -> Result<Option<String>, Error> {
@@ -261,7 +264,10 @@ async fn authenticate(
     // whether it is an anonymous principal or a refusal, the same way it
     // decides for any other username it does not know.
     let (username, password) = login.map_or(("", ""), |l| (&*l.username, &*l.password));
-    match access.authenticate(client_id, username, password).await {
+    match access
+        .authenticate_from(peer, client_id, username, password)
+        .await
+    {
         Some(principal) => Ok(Some(principal)),
         None => Err(Error::InvalidAuth),
     }
@@ -459,12 +465,16 @@ mod tests {
             password: "nope".to_owned(),
         };
         assert_eq!(
-            super::authenticate(&cfg, Some(&good), "c").await.unwrap(),
+            super::authenticate(&cfg, None, Some(&good), "c")
+                .await
+                .unwrap(),
             Some("alice".to_owned())
         );
-        assert!(super::authenticate(&cfg, Some(&bad), "c").await.is_err());
+        assert!(super::authenticate(&cfg, None, Some(&bad), "c")
+            .await
+            .is_err());
         // Fixed refuses the empty login, so a login-less CONNECT is still refused.
-        assert!(super::authenticate(&cfg, None, "c").await.is_err());
+        assert!(super::authenticate(&cfg, None, None, "c").await.is_err());
     }
 
     /// Admits the empty login as an anonymous principal and records what it was
@@ -504,7 +514,7 @@ mod tests {
         cfg.access_control = Some(access.clone());
         let cfg = Arc::new(cfg);
 
-        let who = super::authenticate(&cfg, None, "c-1").await;
+        let who = super::authenticate(&cfg, None, None, "c-1").await;
         assert_eq!(who.unwrap(), Some("$anon".to_owned()));
         assert_eq!(
             access.asked.lock().unwrap().clone(),
@@ -521,13 +531,17 @@ mod tests {
             username: "alice".to_owned(),
             password: "nope".to_owned(),
         };
-        assert!(super::authenticate(&cfg, Some(&bad), "c").await.is_err());
+        assert!(super::authenticate(&cfg, None, Some(&bad), "c")
+            .await
+            .is_err());
         let good = Login {
             username: "alice".to_owned(),
             password: "pw".to_owned(),
         };
         assert_eq!(
-            super::authenticate(&cfg, Some(&good), "c").await.unwrap(),
+            super::authenticate(&cfg, None, Some(&good), "c")
+                .await
+                .unwrap(),
             Some("alice".to_owned())
         );
     }
@@ -538,18 +552,23 @@ mod tests {
     #[tokio::test]
     async fn without_access_control_a_login_less_connect_keeps_the_legacy_rule() {
         let open = Arc::new(config());
-        assert_eq!(super::authenticate(&open, None, "c").await.unwrap(), None);
+        assert_eq!(
+            super::authenticate(&open, None, None, "c").await.unwrap(),
+            None
+        );
 
         let mut with_static = config();
         with_static.auth = Some(HashMap::from([("u".to_owned(), "p".to_owned())]));
-        assert!(super::authenticate(&Arc::new(with_static), None, "c")
+        assert!(super::authenticate(&Arc::new(with_static), None, None, "c")
             .await
             .is_err());
 
         let mut with_external = config();
         with_external.set_auth_handler(|_: String, _: String, _: String| async { true });
-        assert!(super::authenticate(&Arc::new(with_external), None, "c")
-            .await
-            .is_err());
+        assert!(
+            super::authenticate(&Arc::new(with_external), None, None, "c")
+                .await
+                .is_err()
+        );
     }
 }

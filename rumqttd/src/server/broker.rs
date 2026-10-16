@@ -565,6 +565,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                             stream,
                             protocol,
                             self.awaiting_will_handler.clone(),
+                            Some(addr),
                         )
                         .instrument(tracing::info_span!(
                             "websocket_link",
@@ -581,6 +582,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                         network,
                         protocol,
                         self.awaiting_will_handler.clone(),
+                        Some(addr),
                     )
                     .instrument(tracing::error_span!(
                         "remote_link",
@@ -633,6 +635,7 @@ async fn remote<P: Protocol>(
     stream: Box<dyn N>,
     protocol: P,
     will_handlers: Arc<Mutex<HashMap<String, Sender<AwaitingWill>>>>,
+    peer: Option<std::net::SocketAddr>,
 ) {
     let mut network = Network::new(
         stream,
@@ -643,7 +646,7 @@ async fn remote<P: Protocol>(
 
     let dynamic_filters = config.dynamic_filters;
 
-    let (connect_packet, principal) = match mqtt_connect(config, &mut network).await {
+    let (connect_packet, principal) = match mqtt_connect(config, &mut network, peer).await {
         Ok(p) => p,
         Err(e) => {
             error!(error=?e, "Error while handling MQTT connect packet");

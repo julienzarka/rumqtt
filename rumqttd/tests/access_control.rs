@@ -4,8 +4,8 @@
 //! broker is under test.
 
 use std::future::Future;
-use std::net::TcpListener as StdTcpListener;
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rumqttd::{AccessControl, Broker, Config, PrincipalFuture};
@@ -68,6 +68,39 @@ impl AccessControl for OpenToAnonymous {
     fn can_subscribe(&self, principal: &str, filter: &str) -> bool {
         let root = principal.trim_start_matches('$');
         filter.starts_with(&format!("{root}/")) && !filter.contains(['#', '+'])
+    }
+}
+
+/// Admits everyone and records the peer address the broker hands over.
+#[derive(Debug, Default)]
+struct PeerRecorder {
+    peers: Mutex<Vec<Option<SocketAddr>>>,
+}
+
+impl AccessControl for PeerRecorder {
+    fn authenticate(&self, _client_id: &str, _user: &str, _pass: &str) -> PrincipalFuture {
+        Box::pin(async { None })
+    }
+
+    fn authenticate_from(
+        &self,
+        peer: Option<SocketAddr>,
+        _client_id: &str,
+        _user: &str,
+        _pass: &str,
+    ) -> PrincipalFuture {
+        if let Ok(mut peers) = self.peers.lock() {
+            peers.push(peer);
+        }
+        Box::pin(async { Some("any".to_owned()) })
+    }
+
+    fn can_publish(&self, _principal: &str, _topic: &str, _payload: &[u8]) -> bool {
+        true
+    }
+
+    fn can_subscribe(&self, _principal: &str, _filter: &str) -> bool {
+        true
     }
 }
 
@@ -352,6 +385,40 @@ fn a_login_less_connect_is_still_refused_when_the_embedder_refuses_it() {
         for (port, v) in [(p4, 4u8), (p5, 5u8)] {
             let anon = Conn::open(port, connect(v, "c", None, None)).await;
             assert!(anon.map_or(true, |(_, ack)| !accepted(&ack)), "v{v}");
+        }
+    });
+}
+
+/// The broker calls `authenticate_from` with the TCP peer of the connection,
+/// on every listener.
+#[test]
+fn authenticate_from_receives_the_tcp_peer_of_the_connection() {
+    let rec = Arc::new(PeerRecorder::default());
+    run_with(rec.clone(), |p4, p5| async move {
+        for (port, v) in [(p4, 4u8), (p5, 5u8)] {
+            let (_c, ack) = Conn::open(port, connect(v, "peer-c", None, None))
+                .await
+                .expect("connack");
+            assert!(accepted(&ack), "v{v}");
+        }
+    });
+    let peers = rec.peers.lock().expect("lock").clone();
+    assert_eq!(peers.len(), 2, "one call per CONNECT: {peers:?}");
+    for peer in peers {
+        let peer = peer.expect("a socket connection has a peer");
+        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(peer.port(), 0);
+    }
+}
+
+/// An embedder that implements only `authenticate` is still asked, through the
+/// default `authenticate_from`.
+#[test]
+fn an_authenticate_only_embedder_still_works_through_the_default() {
+    run(|p4, p5| async move {
+        for (port, v) in [(p4, 4u8), (p5, 5u8)] {
+            assert!(login(port, v, "c", "alice", "pw-a").await.is_some(), "v{v}");
+            assert!(login(port, v, "c", "alice", "nope").await.is_none(), "v{v}");
         }
     });
 }

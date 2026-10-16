@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -21,6 +22,22 @@ pub trait AccessControl: Send + Sync + fmt::Debug {
     /// the embedder chooses between an anonymous principal and a refusal; an
     /// embedder that wants every client named must return `None` for it.
     fn authenticate(&self, client_id: &str, username: &str, password: &str) -> PrincipalFuture;
+
+    /// [`authenticate`](Self::authenticate) with the connection's source. The
+    /// broker calls this one; `peer` is the TCP peer of the connection (`None`
+    /// when the transport has none). The default ignores `peer` and forwards
+    /// to `authenticate`, so an embedder that does not need it implements
+    /// nothing more.
+    fn authenticate_from(
+        &self,
+        peer: Option<SocketAddr>,
+        client_id: &str,
+        username: &str,
+        password: &str,
+    ) -> PrincipalFuture {
+        let _ = peer;
+        self.authenticate(client_id, username, password)
+    }
 
     /// May `principal` publish `payload` on `topic`? A `false` drops the
     /// message: it is acked as usual (MQTT 3.1.1 has no negative PUBACK) but

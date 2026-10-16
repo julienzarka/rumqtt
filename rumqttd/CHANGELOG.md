@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [rumqttd 0.20.4] - 16-10-2026
+
+### Added
+- `AccessControl::authenticate_from(peer, client_id, username, password)`: the broker now calls this method, passing the TCP peer address of the connection (`None` when the transport has none), so an embedder can budget or rate-limit authority lookups per source. It has a default body that forwards to `authenticate`, so existing implementations compile and behave unchanged.
+
 ## [rumqttd 0.20.3] - 15-10-2026
 
 ### Changed
