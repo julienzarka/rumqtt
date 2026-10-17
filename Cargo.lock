@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "rumqttd"
-version = "0.20.4"
+version = "0.20.5"
 dependencies = [
  "async-tungstenite 0.25.1",
  "axum",
@@ -2388,6 +2388,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",

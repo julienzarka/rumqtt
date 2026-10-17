@@ -213,12 +213,11 @@ pub async fn tls_connect<P: AsRef<Path>>(
         return Err(BridgeError::NoValidCertInChain);
     }
 
-    let config = ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| BridgeError::Tls(e))?
-    .with_root_certificates(root_cert_store);
+    let config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| BridgeError::Tls(e))?
+            .with_root_certificates(root_cert_store);
 
     let config = if let Some(ClientAuth {
         certs: certs_path,

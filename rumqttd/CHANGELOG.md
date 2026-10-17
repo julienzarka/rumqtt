@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [rumqttd 0.20.5] - 17-10-2026
+
+### Changed
+- `use-rustls` now uses the rustls `ring` crypto provider instead of `aws_lc_rs`. `tokio-rustls` is taken with `default-features = false` (keeping `logging` and `tls12`), so neither the server TLS acceptor nor the bridge client pulls `aws-lc-rs` and `aws-lc-sys` into the build. An embedder that enables `rustls/aws_lc_rs` itself is unaffected: rumqttd builds its configs with an explicit provider, never the process default.
+
 ## [rumqttd 0.20.4] - 16-10-2026
 
 ### Added

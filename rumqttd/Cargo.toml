@@ -1,6 +1,6 @@
 [package]
 name = "rumqttd"
-version = "0.20.4"
+version = "0.20.5"
 publish = true
 description = "rumqttd is a high performance MQTT broker written in Rust which is light weight and embeddable"
 keywords = ["mqtt", "broker", "iot", "kafka", "nats"]
@@ -20,7 +20,7 @@ flume = { version = "0.11.0", default-features = false, features = ["async"]}
 slab = "0.4.9"
 thiserror = "2.0"
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
-tokio-rustls = { version = "0.26", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
 tokio-native-tls = { version = "0.3.1", optional = true }
 rustls-pemfile = { version = "2.1.0", optional = true }
@@ -42,7 +42,7 @@ subtle = "2.5"
 
 [features]
 default = ["use-rustls", "websocket"]
-use-rustls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:x509-parser", "rustls/aws_lc_rs"]
+use-rustls = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile", "dep:x509-parser", "rustls/ring", "tokio-rustls/ring"]
 use-native-tls = ["dep:tokio-native-tls", "dep:x509-parser"]
 websocket = ["dep:async-tungstenite", "dep:tokio-util", "dep:futures-util", "dep:ws_stream_tungstenite"]
 verify-client-cert = []

@@ -227,11 +227,10 @@ impl TLSAcceptor {
             (certs, key)
         };
 
-        let builder = ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(Error::Rustls)?;
+        let builder =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(Error::Rustls)?;
 
         // client authentication with a CA. CA isn't required otherwise
         #[cfg(feature = "verify-client-cert")]
@@ -297,11 +296,10 @@ impl TLSAcceptor {
             (certs, key)
         };
 
-        let builder = ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(Error::Rustls)?;
+        let builder =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(Error::Rustls)?;
 
         #[cfg(feature = "verify-client-cert")]
         let builder = {
@@ -493,7 +491,7 @@ mod verify_client_cert_tests {
     }
 
     fn client_config(client_cert_pem: &[u8], client_key_pem: &[u8]) -> ClientConfig {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &client_cert_pem[..])
             .collect::<Result<_, _>>()
             .expect("parse client certs");
@@ -548,7 +546,7 @@ mod verify_client_cert_tests {
     #[tokio::test]
     async fn valid_client_cert_accepted_rogue_rejected() {
         // Unambiguous provider for the bare client builder; Err = already set.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let pki = make_pki();
 
         assert!(
