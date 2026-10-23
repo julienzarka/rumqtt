@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "rumqttd"
-version = "0.20.5"
+version = "0.20.6"
 dependencies = [
  "async-tungstenite 0.25.1",
  "axum",

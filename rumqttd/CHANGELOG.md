@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [rumqttd 0.20.6] - 23-10-2026
+
+### Fixed
+- A refused CONNECT (an `AccessControl` that does not admit the login, a will the principal may not publish, or a failed `auth` / `external_auth` check) is answered with CONNACK return code 5 "not authorized" (reason 0x87 on MQTT 5) before the connection closes. Clients used to see the socket close before any CONNACK and could not tell a refusal from a broker that went away.
+
+---
+
 ## [rumqttd 0.20.5] - 17-10-2026
 
 ### Changed

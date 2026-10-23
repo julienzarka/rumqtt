@@ -206,7 +206,10 @@ where
 
     Span::current().record("client_id", &connect.client_id);
 
-    let principal = authenticate(&config, peer, login.as_ref(), &connect.client_id).await?;
+    let principal = match authenticate(&config, peer, login.as_ref(), &connect.client_id).await {
+        Ok(principal) => principal,
+        Err(e) => return Err(refuse(network, e).await),
+    };
 
     // A will is published by the router after the client is gone, outside the
     // per-publish check: refuse a CONNECT whose will the principal could not
@@ -216,7 +219,7 @@ where
     {
         let topic = String::from_utf8_lossy(&will.topic);
         if !access.can_publish(principal, &topic, &will.message) {
-            return Err(Error::InvalidAuth);
+            return Err(refuse(network, Error::InvalidAuth).await);
         }
     }
 
@@ -243,6 +246,22 @@ where
 
     // Ok((connect, props, lastwill, lastwill_props))
     Ok((packet, principal))
+}
+
+/// Answer a refused CONNECT with CONNACK "not authorized" (return code 5, or
+/// reason 0x87 on MQTT 5) before the connection closes, so the client sees a
+/// refusal rather than a broker that went away. Every refusal gets the same
+/// code: the client is not told whether the user or the password was wrong.
+/// A failed write is ignored, because the connection is dropped either way.
+async fn refuse<P: Protocol>(network: &mut Network<P>, error: Error) -> Error {
+    let ack = ConnAck {
+        session_present: false,
+        code: ConnectReturnCode::NotAuthorized,
+    };
+    if let Err(e) = network.write(Packet::ConnAck(ack, None)).await {
+        trace!(error = ?e, "CONNACK not authorized was not delivered");
+    }
+    error
 }
 
 /// Resolve the principal for a CONNECT: the embedder's [`crate::AccessControl`]
@@ -570,5 +589,137 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Drive `mqtt_connect` over an in-memory socket and return what it
+    /// decided plus the first packet the client reads back, if any.
+    async fn connect_over_duplex(
+        cfg: ConnectionSettings,
+        login: Option<Login>,
+        will: Option<crate::protocol::LastWill>,
+    ) -> (
+        Result<(crate::protocol::Packet, Option<String>), super::Error>,
+        Option<crate::protocol::Packet>,
+    ) {
+        use crate::link::network::Network;
+        use crate::protocol::{v4::V4, Connect, Packet};
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let mut client = Network::new(Box::new(client_io), 4096, 10, V4);
+        let mut server = Network::new(Box::new(server_io), 4096, 10, V4);
+        let connect = Connect {
+            keep_alive: 30,
+            client_id: "c".to_owned(),
+            clean_session: true,
+        };
+        client
+            .write(Packet::Connect(connect, None, will, None, login))
+            .await
+            .unwrap();
+
+        let mut cfg = cfg;
+        cfg.connection_timeout_ms = 1000;
+        let decided = super::mqtt_connect(Arc::new(cfg), &mut server, None).await;
+        drop(server);
+        (decided, client.read().await.ok())
+    }
+
+    fn not_authorized(packet: Option<crate::protocol::Packet>) -> bool {
+        matches!(
+            packet,
+            Some(crate::protocol::Packet::ConnAck(
+                crate::protocol::ConnAck {
+                    code: crate::protocol::ConnectReturnCode::NotAuthorized,
+                    ..
+                },
+                _
+            ))
+        )
+    }
+
+    /// A refused CONNECT is answered with CONNACK return code 5 before the
+    /// close, so a client can tell a refusal from a broker that went away.
+    #[tokio::test]
+    async fn a_refused_login_gets_connack_not_authorized_before_the_close() {
+        let mut cfg = config();
+        cfg.access_control = Some(Arc::new(Fixed));
+        let bad = Login {
+            username: "alice".to_owned(),
+            password: "nope".to_owned(),
+        };
+
+        let (decided, reply) = connect_over_duplex(cfg, Some(bad), None).await;
+
+        assert!(matches!(decided, Err(super::Error::InvalidAuth)));
+        assert!(not_authorized(reply.clone()), "client read {reply:?}");
+    }
+
+    /// Same answer for the legacy static `auth` table, so the wire shape of a
+    /// refusal does not depend on which check refused it.
+    #[tokio::test]
+    async fn a_refused_static_login_gets_connack_not_authorized() {
+        let mut cfg = config();
+        cfg.auth = Some(HashMap::from([("u".to_owned(), "p".to_owned())]));
+        let bad = Login {
+            username: "u".to_owned(),
+            password: "wrong".to_owned(),
+        };
+
+        let (decided, reply) = connect_over_duplex(cfg, Some(bad), None).await;
+
+        assert!(matches!(decided, Err(super::Error::InvalidAuth)));
+        assert!(not_authorized(reply.clone()), "client read {reply:?}");
+    }
+
+    #[derive(Debug)]
+    struct NoWill;
+
+    impl crate::AccessControl for NoWill {
+        fn authenticate(&self, _: &str, _: &str, _: &str) -> crate::PrincipalFuture {
+            Box::pin(async { Some("p".to_owned()) })
+        }
+
+        fn can_publish(&self, _: &str, _: &str, _: &[u8]) -> bool {
+            false
+        }
+
+        fn can_subscribe(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
+    /// A will the principal could not publish refuses the CONNECT the same way.
+    #[tokio::test]
+    async fn a_refused_will_gets_connack_not_authorized() {
+        let mut cfg = config();
+        cfg.access_control = Some(Arc::new(NoWill));
+        let will = crate::protocol::LastWill {
+            topic: bytes::Bytes::from_static(b"other/topic"),
+            message: bytes::Bytes::from_static(b"gone"),
+            qos: crate::protocol::QoS::AtMostOnce,
+            retain: false,
+        };
+
+        let (decided, reply) = connect_over_duplex(cfg, Some(login()), Some(will)).await;
+
+        assert!(matches!(decided, Err(super::Error::InvalidAuth)));
+        assert!(not_authorized(reply.clone()), "client read {reply:?}");
+    }
+
+    /// An accepted CONNECT is untouched: the CONNACK is still the router's
+    /// to send, so `mqtt_connect` writes nothing.
+    #[tokio::test]
+    async fn an_accepted_login_writes_no_connack_here() {
+        let mut cfg = config();
+        cfg.access_control = Some(Arc::new(Fixed));
+        let good = Login {
+            username: "alice".to_owned(),
+            password: "pw".to_owned(),
+        };
+
+        let (decided, reply) = connect_over_duplex(cfg, Some(good), None).await;
+
+        assert!(decided.is_ok());
+        assert!(reply.is_none(), "client read {reply:?}");
     }
 }
